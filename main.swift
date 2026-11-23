@@ -6,6 +6,7 @@ import CoreImage
 import ScreenCaptureKit
 import ApplicationServices
 import CoreText
+import ImageIO
 
 // MARK: - Dokular
 
@@ -34,6 +35,10 @@ enum Pref {
     static var randomBehaviors: Bool {
         get { d.object(forKey: "randomBehaviors") as? Bool ?? true }
         set { d.set(newValue, forKey: "randomBehaviors") }
+    }
+    static var webpToPng: Bool {
+        get { d.object(forKey: "webpToPng") as? Bool ?? true }
+        set { d.set(newValue, forKey: "webpToPng") }
     }
     static var autoAnnotate: Bool {
         get { d.bool(forKey: "autoAnnotate") }
@@ -86,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var localClickMonitor: Any?
     var capturing = false
     var selectionWindows: [NSWindow] = []
+    let webpWatcher = WebpWatcher()
 
     // çöp kutusu korkusu
     var fear: CGFloat = 0
@@ -151,6 +157,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             _ = AXIsProcessTrustedWithOptions(opts)
         }
         registerHotKey()
+        webpWatcher.onConverted = { [weak self] in self?.surprise(0.6) }
+        if Pref.webpToPng { webpWatcher.start() }
         tick()
     }
 
@@ -187,6 +195,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(item("Panodaki Görseli Aç ve İşaretle…", #selector(openAnnotatorFromClipboard)))
         let auto = item("⌥⇧S Sonrası İşaretlemeyi Aç", #selector(toggleAutoAnnotate)); auto.tag = 43
         m.addItem(auto)
+        let webp = item("İndirilen WebP'leri PNG'ye Çevir", #selector(toggleWebp)); webp.tag = 45
+        webp.toolTip = "İndirilenler ve Masaüstü'ne gelen yeni .webp dosyalarını .png yapar; WebP'nin aslı Çöp Sepeti'ne gider"
+        m.addItem(webp)
         m.addItem(.separator())
 
         let rnd = item("Rastgele Davranışlar", #selector(toggleRandom)); rnd.tag = 44
@@ -235,6 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.item(withTag: 43)?.state = Pref.autoAnnotate ? .on : .off
         menu.item(withTag: 44)?.state = Pref.randomBehaviors ? .on : .off
+        menu.item(withTag: 45)?.state = Pref.webpToPng ? .on : .off
         for i in menu.items { if let sub = i.submenu { menuWillOpen(sub) } }
         for i in menu.items where i.tag == 100 {
             i.state = (i.representedObject as? Double) == Pref.sleepAfter ? .on : .off
@@ -242,6 +254,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleAutoAnnotate() { Pref.autoAnnotate.toggle() }
+    @objc func toggleWebp() {
+        Pref.webpToPng.toggle()
+        if Pref.webpToPng { webpWatcher.start() } else { webpWatcher.stop() }
+    }
     @objc func toggleRandom() { Pref.randomBehaviors.toggle() }
     @objc func setSleep(_ sender: NSMenuItem) {
         Pref.sleepAfter = sender.representedObject as? Double ?? 60
@@ -776,6 +792,96 @@ enum TrashWatch {
                 && (w[kCGWindowLayer as String] as? Int) == 0
                 && trashNames.contains(w[kCGWindowName as String] as? String ?? "")
         }
+    }
+}
+
+// MARK: - WebP → PNG
+
+/// İndirilenler ve Masaüstü'nü izler; yeni gelen .webp dosyalarını aynı isimle .png'ye çevirir.
+final class WebpWatcher {
+    var onConverted: (() -> Void)?
+    private var sources: [DispatchSourceFileSystemObject] = []
+    private var seen: Set<String> = []          // zaten bilinen / işlenmiş webp dosyaları
+    private var pendingScan: DispatchWorkItem?
+    private let fm = FileManager.default
+
+    private var folders: [URL] {
+        [fm.urls(for: .downloadsDirectory, in: .userDomainMask).first,
+         fm.urls(for: .desktopDirectory, in: .userDomainMask).first].compactMap { $0 }
+    }
+
+    func start() {
+        guard sources.isEmpty else { return }
+        // izleme başladığında var olan eski webp'lere dokunma
+        for d in folders { for f in webps(in: d) { seen.insert(f.path) } }
+        for d in folders {
+            let fd = open(d.path, O_EVTONLY)
+            guard fd >= 0 else { continue }
+            let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename], queue: .main)
+            src.setEventHandler { [weak self] in self?.scheduleScan() }
+            src.setCancelHandler { close(fd) }
+            src.resume()
+            sources.append(src)
+        }
+    }
+
+    func stop() {
+        sources.forEach { $0.cancel() }
+        sources.removeAll()
+        pendingScan?.cancel()
+    }
+
+    private func webps(in dir: URL) -> [URL] {
+        let items = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        return items.filter { $0.pathExtension.lowercased() == "webp" }
+    }
+
+    private func scheduleScan() {
+        pendingScan?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.scan() }
+        pendingScan = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: w)
+    }
+
+    private func scan() {
+        for d in folders {
+            for f in webps(in: d) where !seen.contains(f.path) {
+                waitUntilStable(f, lastSize: -1, tries: 0)
+            }
+        }
+    }
+
+    private func size(of url: URL) -> Int {
+        ((try? fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue ?? -1
+    }
+
+    /// Tarayıcı dosyayı yazmayı bitirene kadar bekle (boyut iki kontrolde aynı kalmalı)
+    private func waitUntilStable(_ url: URL, lastSize: Int, tries: Int) {
+        let s = size(of: url)
+        if s < 0 { return }                                    // dosya kaybolmuş
+        if s > 0 && s == lastSize { seen.insert(url.path); convert(url); return }
+        if tries > 40 { return }                               // ~30 sn sonra vazgeç
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+            self?.waitUntilStable(url, lastSize: s, tries: tries + 1)
+        }
+    }
+
+    private func convert(_ url: URL) {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return }
+        // hareketli webp'ler PNG'ye çevrilince animasyon kaybolur: onlara dokunma
+        guard CGImageSourceGetCount(src) == 1,
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return }
+        let base = url.deletingPathExtension()
+        var out = base.appendingPathExtension("png")
+        var i = 2
+        while fm.fileExists(atPath: out.path) {
+            out = URL(fileURLWithPath: base.path + " (\(i))").appendingPathExtension("png"); i += 1
+        }
+        guard let dest = CGImageDestinationCreateWithURL(out as CFURL, "public.png" as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(dest, img, nil)
+        guard CGImageDestinationFinalize(dest) else { return }
+        try? fm.trashItem(at: url, resultingItemURL: nil)     // aslı Çöp Sepeti'ne (geri alınabilir)
+        onConverted?()
     }
 }
 

@@ -18,6 +18,10 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 - Görüntü panoya kopyalanır ve masaüstüne kaydedilir
 - Yakalama ScreenCaptureKit ile yapılır (macOS 14+)
 
+**WebP → PNG**
+- İndirilenler ve Masaüstü'ne gelen yeni `.webp` dosyaları otomatik olarak aynı isimle `.png`'ye çevrilir; aslı Çöp Sepeti'ne gider
+- Hareketli WebP'lere dokunulmaz · Menüden açılıp kapatılabilir
+
 **İşaretleme**
 - Gözlere tıkla → *Panodaki Görseli Aç ve İşaretle*
 - Kalem, ok (sivri / yumuşak, düz / eğri), kutu, fosforlu kalem, yazı (Yuvarlak / Montserrat), numaralı işaret, pikselleştirme, bulanıklaştırma

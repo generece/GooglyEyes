@@ -13,6 +13,7 @@
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSDownloadsFolderUsageDescription</key><string>İndirilen WebP görsellerini PNG'ye çevirmek için.</string>
     <key>NSDesktopFolderUsageDescription</key><string>Ekran görüntülerini masaüstüne kaydetmek için.</string>
 </dict>
 </plist>
