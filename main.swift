@@ -975,13 +975,12 @@ enum Tool: Int { case pen, arrow, rect, marker, text, number, pixelate, blur, er
 
 /// Yazı aracı için font seçenekleri
 enum TextFont: Int, CaseIterable {
-    case rounded, montserrat, sans
+    case rounded, montserrat
 
     var title: String {
         switch self {
         case .rounded: return "Yuvarlak"
         case .montserrat: return "Montserrat"
-        case .sans: return "Sans Serif"
         }
     }
 
@@ -1000,9 +999,7 @@ enum TextFont: Int, CaseIterable {
             return base
         case .montserrat:
             _ = TextFont.registerOnce
-            return NSFont(name: "Montserrat-Bold", size: size) ?? TextFont.sans.font(size: size)
-        case .sans:
-            return NSFont(name: "HelveticaNeue-Bold", size: size) ?? NSFont.boldSystemFont(ofSize: size)
+            return NSFont(name: "Montserrat-Bold", size: size) ?? NSFont.boldSystemFont(ofSize: size)
         }
     }
 }
