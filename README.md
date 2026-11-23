@@ -11,6 +11,7 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 - Sallama: mouse'u hızla sağa sola sallayınca göz bebekleri çılgınca döner
 - Rastgele davranışlar: göz kırpma, göz devirme, şaşı bakma, spiral göz bebekleri
 - Şaşırma: ekran görüntüsü alırken ve panoya bir şey kopyalanınca göz bebekleri büyür
+- Çöp kutusu korkusu: mouse Dock'taki çöp kutusunun üstündeyken ya da Çöp Sepeti açıkken göz bebekleri küçülür ve titrer (Erişilebilirlik izni gerekir)
 
 **Ekran görüntüsü — ⌥⇧S**
 - Bölge seçimi; birden fazla ekranda çalışır

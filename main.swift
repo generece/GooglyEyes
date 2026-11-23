@@ -4,6 +4,7 @@ import Carbon.HIToolbox
 import ServiceManagement
 import CoreImage
 import ScreenCaptureKit
+import ApplicationServices
 
 // MARK: - Dokular
 
@@ -84,6 +85,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var localClickMonitor: Any?
     var capturing = false
     var selectionWindows: [NSWindow] = []
+
+    // çöp kutusu korkusu
+    var fear: CGFloat = 0
+    var trashOpen = false
+    var lastTrashCheck: CFTimeInterval = 0
+    var forcedFearUntil: CFTimeInterval = 0
     var previousApp: NSRunningApplication?
     var annotationWindows: [AnnotationWindowController] = []
     var lastDrawKey = ""
@@ -137,6 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         lastMouse = NSEvent.mouseLocation
+        if !AXIsProcessTrusted() && !UserDefaults.standard.bool(forKey: "askedAX") {
+            UserDefaults.standard.set(true, forKey: "askedAX")
+            let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(opts)
+        }
         registerHotKey()
         tick()
     }
@@ -181,7 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let tryItem = NSMenuItem(title: "Hareketleri Dene", action: nil, keyEquivalent: "")
         let tryMenu = NSMenu()
         for (title, tag) in [("Şaşır 😮", 3), ("Göz Devir 🙄", 4), ("Spiral Göz 🌀", 6),
-                             ("Sersemle 💫", 7), ("Uyu 😴", 8)] {
+                             ("Sersemle 💫", 7), ("Uyu 😴", 8), ("Kork 😱", 9)] {
             let i = item(title, #selector(playMove(_:))); i.tag = 200 + tag
             tryMenu.addItem(i)
         }
@@ -199,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(sleepItem)
         m.addItem(.separator())
 
+        m.addItem(item("Çöp Kutusu Korkusu için Erişilebilirlik İzni…", #selector(openAccessibility)))
         let login = item("Girişte Başlat", #selector(toggleLogin(_:))); login.tag = 42
         m.addItem(login)
         m.addItem(item("Ekran Kaydı İzinlerini Aç…", #selector(openPrivacy)))
@@ -247,6 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case 6: special = .spiral; specialStart = now
         case 7: special = .none; dizzyStart = now
         case 8: goToSleep(now)
+        case 9: forcedFearUntil = now + 2.5
         default: break
         }
     }
@@ -258,6 +272,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else { try SMAppService.mainApp.register() }
         } catch {
             alert("Girişte başlatma ayarlanamadı", error.localizedDescription)
+        }
+    }
+
+    @objc func openAccessibility() {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        if !AXIsProcessTrustedWithOptions(opts) {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
         }
     }
 
@@ -348,6 +369,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rightEye.held = pressed & 2 != 0
 
         let mouse = NSEvent.mouseLocation
+
+        // çöp kutusu korkusu: Dock'taki çöp kutusunun üstündeyken ya da çöp kutusu penceresi açıkken
+        if now - lastTrashCheck > 0.4 {
+            lastTrashCheck = now
+            trashOpen = TrashWatch.trashWindowOpen()
+        }
+        var overTrash = false
+        if let f = TrashWatch.trashFrame(now), let primary = NSScreen.screens.first {
+            let p = CGPoint(x: mouse.x, y: primary.frame.maxY - mouse.y)   // AX koordinatları: sol-üst orijin
+            overTrash = f.insetBy(dx: -3, dy: -3).contains(p)
+        }
+        let scared = (overTrash || trashOpen || now < forcedFearUntil) && !sleeping
+        fear += ((scared ? 1 : 0) - fear) * (scared ? 0.25 : 0.07)
+        if fear < 0.003 { fear = 0 }
+
         if hypot(mouse.x - lastMouse.x, mouse.y - lastMouse.y) > 0.5 {
             noteActivity(now)
             trackShake(now, mouse.x)
@@ -419,9 +455,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let sAmt = surpriseAmount(now)
         var key = [leftEye, rightEye].map {
             String(format: "%.2f,%.2f,%d", $0.pos.x, $0.pos.y, $0.isClosed ? 1 : 0)
-        }.joined(separator: "|") + String(format: "|%.3f|%d", sAmt, sleeping ? 1 : 0)
+        }.joined(separator: "|") + String(format: "|%.3f|%d|%.3f", sAmt, sleeping ? 1 : 0, fear)
         if sleeping { key += "|\(Int(now * 30))" }
-        if special == .spiral { key += "|s\(Int(now * 60))" }
+        if special == .spiral || fear > 0.01 { key += "|s\(Int(now * 60))" }
         if key == lastDrawKey { return }
         lastDrawKey = key
         button.image = renderEyes(now: now, surprise: sAmt)
@@ -455,14 +491,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         // şaşırınca göz akı sabit kalır, göz bebeği beyazın neredeyse tamamını kaplayacak kadar büyür
-        let ps = pupilSize + (es * 0.88 - pupilSize) * s
+        var ps = pupilSize + (es * 0.88 - pupilSize) * s
+        ps *= 1 - 0.55 * fear                      // korkunca göz bebeği küçülür
         let range = (es - ps) / 2 - 0.6
         let sRect = NSRect(x: c.x - es / 2, y: c.y - es / 2, width: es, height: es)
         Tex.sclera.draw(in: sRect)
         NSGraphicsContext.saveGraphicsState()
         NSBezierPath(ovalIn: sRect.insetBy(dx: 0.5, dy: 0.5)).addClip()
         let k = maxR > 0 ? range / maxR : 1
-        let p = CGPoint(x: c.x + eye.pos.x * k, y: c.y + eye.pos.y * k)
+        let jitter = fear * eyeSize * 0.05         // korkunca titrer
+        let p = CGPoint(x: c.x + eye.pos.x * k + CGFloat.random(in: -1...1) * jitter,
+                        y: c.y + eye.pos.y * k + CGFloat.random(in: -1...1) * jitter)
         if special == .spiral {
             // spiral göz bebeği: büyüyerek gelir, kendi merkezinde içe doğru akar gibi döner
             let st = now - specialStart
@@ -680,6 +719,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func alert(_ title: String, _ text: String) {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert(); a.messageText = title; a.informativeText = text; a.runModal()
+    }
+}
+
+// MARK: - Çöp kutusu takibi
+
+enum TrashWatch {
+    static var cachedFrame: CGRect?
+    static var lastFetch: CFTimeInterval = -100
+
+    static let trashNames: Set<String> = {
+        var n: Set<String> = ["Trash", "Çöp Sepeti", "Çöp Kutusu"]
+        n.insert(FileManager.default.displayName(atPath: NSHomeDirectory() + "/.Trash"))
+        return n
+    }()
+
+    /// Dock'taki çöp kutusu simgesinin yeri (AX koordinatları). Erişilebilirlik izni gerekir.
+    static func trashFrame(_ now: CFTimeInterval) -> CGRect? {
+        if now - lastFetch < 2 { return cachedFrame }      // Dock nadiren değişir; 2 sn'de bir sor
+        lastFetch = now
+        guard AXIsProcessTrusted(),
+              let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first
+        else { cachedFrame = nil; return nil }
+        cachedFrame = find(AXUIElementCreateApplication(dock.processIdentifier), depth: 0)
+        return cachedFrame
+    }
+
+    static func attr(_ e: AXUIElement, _ name: String) -> AnyObject? {
+        var v: AnyObject?
+        return AXUIElementCopyAttributeValue(e, name as CFString, &v) == .success ? v : nil
+    }
+
+    static func find(_ e: AXUIElement, depth: Int) -> CGRect? {
+        if (attr(e, kAXSubroleAttribute as String) as? String) == "AXTrashDockItem" { return frame(e) }
+        guard depth < 3, let kids = attr(e, kAXChildrenAttribute as String) as? [AXUIElement] else { return nil }
+        for k in kids { if let f = find(k, depth: depth + 1) { return f } }
+        return nil
+    }
+
+    static func frame(_ e: AXUIElement) -> CGRect? {
+        guard let p = attr(e, kAXPositionAttribute as String), let s = attr(e, kAXSizeAttribute as String) else { return nil }
+        var pt = CGPoint.zero, sz = CGSize.zero
+        AXValueGetValue(p as! AXValue, .cgPoint, &pt)
+        AXValueGetValue(s as! AXValue, .cgSize, &sz)
+        return CGRect(origin: pt, size: sz)
+    }
+
+    /// Ekranda açık bir Çöp Sepeti penceresi var mı (pencere adları Ekran Kaydı izniyle okunur)
+    static func trashWindowOpen() -> Bool {
+        guard let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first,
+              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return false }
+        return list.contains { w in
+            (w[kCGWindowOwnerPID as String] as? Int32) == finder.processIdentifier
+                && (w[kCGWindowLayer as String] as? Int) == 0
+                && trashNames.contains(w[kCGWindowName as String] as? String ?? "")
+        }
     }
 }
 
