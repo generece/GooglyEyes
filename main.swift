@@ -1008,41 +1008,152 @@ enum TextFont: Int, CaseIterable {
 }
 
 enum ArrowStyle: Int { case sharp, soft }
+enum EraserMode: Int { case whole, partial }
+enum CropHandle { case none, move, l, r, t, b, tl, tr, bl, br }
 
 struct Mark {
     var tool: Tool
     var color: NSColor
-    var width: CGFloat          // görsel pikseli: çizgi kalınlığı / yazı boyu / numara çapı
+    var width: CGFloat          // görsel pikseli: çizgi kalınlığı / yazı boyu / numara çapı / silgi çapı
     var points: [CGPoint]       // görsel pikseli cinsinden (sol-alt orijin)
     var text: String = ""
     var font: TextFont = .rounded
     var arrow: ArrowStyle = .sharp
+    var curved = false
+}
+
+// MARK: - Yol yardımcıları
+
+enum PathMath {
+    static func segDist(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let l2 = dx * dx + dy * dy
+        if l2 < 0.0001 { return hypot(p.x - a.x, p.y - a.y) }
+        let t = max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2))
+        return hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy))
+    }
+
+    static func polyDist(_ p: CGPoint, _ pts: [CGPoint]) -> CGFloat {
+        guard let f = pts.first else { return .greatestFiniteMagnitude }
+        if pts.count == 1 { return hypot(p.x - f.x, p.y - f.y) }
+        var d = CGFloat.greatestFiniteMagnitude
+        for i in 1..<pts.count { d = min(d, segDist(p, pts[i - 1], pts[i])) }
+        return d
+    }
+
+    /// Ramer–Douglas–Peucker: titrek elle çizimdeki gereksiz noktaları at
+    static func simplify(_ pts: [CGPoint], _ eps: CGFloat) -> [CGPoint] {
+        guard pts.count > 2 else { return pts }
+        var maxD: CGFloat = 0, idx = 0
+        for i in 1..<(pts.count - 1) {
+            let d = segDist(pts[i], pts[0], pts[pts.count - 1])
+            if d > maxD { maxD = d; idx = i }
+        }
+        if maxD <= eps { return [pts[0], pts[pts.count - 1]] }
+        let a = simplify(Array(pts[0...idx]), eps), b = simplify(Array(pts[idx...]), eps)
+        return Array(a.dropLast()) + b
+    }
+
+    /// Chaikin: köşeleri yuvarlat (uçlar sabit)
+    static func chaikin(_ pts: [CGPoint], iterations: Int) -> [CGPoint] {
+        var p = pts
+        for _ in 0..<iterations {
+            guard p.count > 2 else { return p }
+            var q: [CGPoint] = [p[0]]
+            for i in 0..<(p.count - 1) {
+                let a = p[i], b = p[i + 1]
+                q.append(CGPoint(x: 0.75 * a.x + 0.25 * b.x, y: 0.75 * a.y + 0.25 * b.y))
+                q.append(CGPoint(x: 0.25 * a.x + 0.75 * b.x, y: 0.25 * a.y + 0.75 * b.y))
+            }
+            q.append(p[p.count - 1])
+            p = q
+        }
+        return p
+    }
+
+    static func length(_ pts: [CGPoint]) -> CGFloat {
+        guard pts.count > 1 else { return 0 }
+        var l: CGFloat = 0
+        for i in 1..<pts.count { l += hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y) }
+        return l
+    }
+
+    /// Yolun başından `s` uzunluk kadar ilerideki nokta
+    static func point(at s: CGFloat, _ pts: [CGPoint]) -> CGPoint {
+        guard pts.count > 1 else { return pts.first ?? .zero }
+        var acc: CGFloat = 0
+        for i in 1..<pts.count {
+            let a = pts[i - 1], b = pts[i]
+            let seg = hypot(b.x - a.x, b.y - a.y)
+            if acc + seg >= s, seg > 0 {
+                let t = (s - acc) / seg
+                return CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
+            }
+            acc += seg
+        }
+        return pts[pts.count - 1]
+    }
+
+    /// Yolun başından `s` uzunluğa kadarki kısmı
+    static func prefix(upTo s: CGFloat, _ pts: [CGPoint]) -> [CGPoint] {
+        guard pts.count > 1, s > 0 else { return Array(pts.prefix(1)) }
+        var out: [CGPoint] = [pts[0]]
+        var acc: CGFloat = 0
+        for i in 1..<pts.count {
+            let a = pts[i - 1], b = pts[i]
+            let seg = hypot(b.x - a.x, b.y - a.y)
+            if acc + seg >= s {
+                let t = seg > 0 ? (s - acc) / seg : 0
+                out.append(CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t))
+                return out
+            }
+            out.append(b); acc += seg
+        }
+        return out
+    }
 }
 
 final class AnnotationView: NSView, NSTextFieldDelegate {
     let image: NSImage
     let pixelSize: CGSize
     var marks: [Mark] = [] { didSet { needsDisplay = true; onChange?() } }
-    /// Kırpılmış alan (görsel pikseli). Başlangıçta görselin tamamı.
+    /// Uygulanmış kırpma (görsel pikseli). Başlangıçta görselin tamamı.
     var crop: CGRect = .zero { didSet { needsDisplay = true; window?.invalidateCursorRects(for: self); onChange?() } }
+    /// Kırpma aracı açıkken düzenlenen kırpma çerçevesi
+    var cropEditing: CGRect? { didSet { needsDisplay = true; window?.invalidateCursorRects(for: self) } }
+    var cropDrag: (handle: CropHandle, start: CGPoint, orig: CGRect)?
     /// Geri Al geçmişi: her değişiklikten önceki işaretler + kırpma
     var history: [(marks: [Mark], crop: CGRect)] = [] { didSet { onChange?() } }
     var current: Mark? { didSet { needsDisplay = true } }
-    var tool: Tool = .pen { didSet { commitText(); window?.invalidateCursorRects(for: self) } }
+    var tool: Tool = .pen {
+        didSet {
+            commitText()
+            if oldValue == .crop && tool != .crop { applyCrop() }
+            if tool == .crop && cropEditing == nil { cropEditing = crop }
+            window?.invalidateCursorRects(for: self)
+            needsDisplay = true
+        }
+    }
     var color: NSColor = .systemRed
-    var lineWidth: CGFloat = 4      // ekran noktası cinsinden
+    var lineWidth: CGFloat = 4 { didSet { if tool == .eraser { window?.invalidateCursorRects(for: self) } } }
     var textFont = TextFont(rawValue: UserDefaults.standard.integer(forKey: "textFont")) ?? .rounded {
         didSet {
             UserDefaults.standard.set(textFont.rawValue, forKey: "textFont")
-            if let f = editor { f.font = textFont.font(size: editorFontPx * scale); controlTextDidChange(Notification(name: .init(""))) }
+            if let f = editor { f.font = textFont.font(size: editorFontPx * scale); resizeEditor() }
         }
     }
     var arrowStyle = ArrowStyle(rawValue: UserDefaults.standard.integer(forKey: "arrowStyle")) ?? .sharp {
         didSet { UserDefaults.standard.set(arrowStyle.rawValue, forKey: "arrowStyle") }
     }
+    var arrowCurved = UserDefaults.standard.bool(forKey: "arrowCurved") {
+        didSet { UserDefaults.standard.set(arrowCurved, forKey: "arrowCurved") }
+    }
+    var eraserMode = EraserMode(rawValue: UserDefaults.standard.integer(forKey: "eraserMode")) ?? .whole {
+        didSet { UserDefaults.standard.set(eraserMode.rawValue, forKey: "eraserMode") }
+    }
     var onChange: (() -> Void)?
     var onCommand: ((String) -> Void)?
-    var onCropped: (() -> Void)?
+    var onCropped: ((Bool) -> Void)?
 
     // yazı aracı
     var editor: NSTextField?
@@ -1050,7 +1161,8 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
 
     // silgi
     var erasedThisDrag = false
-    let eraserRadius: CGFloat = 9   // ekran noktası
+    var eraserRadius: CGFloat { 4 + lineWidth * 1.5 }   // ekran noktası; Boyut kaydırıcısıyla değişir
+    var cursorCache: (r: CGFloat, c: NSCursor)?
 
     lazy var pixelated: NSImage? = makeEffect(.pixelate)
     lazy var blurred: NSImage? = makeEffect(.blur)
@@ -1067,45 +1179,68 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func resetCursorRects() {
-        let c: NSCursor
+        let ir = imageRect()
         switch tool {
-        case .text: c = .iBeam
-        case .eraser: c = eraserCursor
-        default: c = .crosshair
+        case .text: addCursorRect(ir, cursor: .iBeam)
+        case .eraser: addCursorRect(ir, cursor: eraserCursor())
+        case .crop:
+            guard let c = cropEditing else { break }
+            let v = viewRect(of: c), t: CGFloat = 8
+            addCursorRect(v.insetBy(dx: t, dy: t), cursor: .openHand)
+            addCursorRect(NSRect(x: v.minX - t, y: v.minY + t, width: 2 * t, height: v.height - 2 * t), cursor: .resizeLeftRight)
+            addCursorRect(NSRect(x: v.maxX - t, y: v.minY + t, width: 2 * t, height: v.height - 2 * t), cursor: .resizeLeftRight)
+            addCursorRect(NSRect(x: v.minX + t, y: v.minY - t, width: v.width - 2 * t, height: 2 * t), cursor: .resizeUpDown)
+            addCursorRect(NSRect(x: v.minX + t, y: v.maxY - t, width: v.width - 2 * t, height: 2 * t), cursor: .resizeUpDown)
+            for p in [NSPoint(x: v.minX, y: v.minY), NSPoint(x: v.maxX, y: v.minY),
+                      NSPoint(x: v.minX, y: v.maxY), NSPoint(x: v.maxX, y: v.maxY)] {
+                addCursorRect(NSRect(x: p.x - t, y: p.y - t, width: 2 * t, height: 2 * t), cursor: .crosshair)
+            }
+        default: addCursorRect(ir, cursor: .crosshair)
         }
-        addCursorRect(imageRect(), cursor: c)
     }
 
-    lazy var eraserCursor: NSCursor = {
-        let d = eraserRadius * 2 + 2
-        let img = NSImage(size: NSSize(width: d, height: d), flipped: false) { r in
-            let o = NSBezierPath(ovalIn: r.insetBy(dx: 1, dy: 1))
-            NSColor.white.withAlphaComponent(0.35).setFill(); o.fill()
+    func eraserCursor() -> NSCursor {
+        let r = eraserRadius
+        if let c = cursorCache, c.r == r { return c.c }
+        let d = r * 2 + 2
+        let img = NSImage(size: NSSize(width: d, height: d), flipped: false) { rect in
+            let o = NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1))
+            NSColor.white.withAlphaComponent(0.3).setFill(); o.fill()
             o.lineWidth = 2; NSColor.black.withAlphaComponent(0.8).setStroke(); o.stroke()
             o.lineWidth = 1; NSColor.white.setStroke(); o.stroke()
             return true
         }
-        return NSCursor(image: img, hotSpot: NSPoint(x: d / 2, y: d / 2))
-    }()
+        let c = NSCursor(image: img, hotSpot: NSPoint(x: d / 2, y: d / 2))
+        cursorCache = (r, c)
+        return c
+    }
 
     // MARK: Koordinatlar
 
     var fullRect: NSRect { NSRect(origin: .zero, size: pixelSize) }
+    /// Ekranda gösterilen bölge: kırpma düzenlenirken görselin tamamı, yoksa kırpılmış alan
+    var viewRegion: CGRect { cropEditing != nil ? fullRect : crop }
 
-    /// Kırpılmış alanın penceredeki yeri
     func imageRect() -> NSRect {
-        let b = bounds.insetBy(dx: 16, dy: 16)
-        let cw = max(crop.width, 1), ch = max(crop.height, 1)
+        let b = bounds.insetBy(dx: 20, dy: 20)
+        let cw = max(viewRegion.width, 1), ch = max(viewRegion.height, 1)
         let s = min(b.width / cw, b.height / ch)
         let w = cw * s, h = ch * s
         return NSRect(x: b.midX - w / 2, y: b.midY - h / 2, width: w, height: h)
     }
-    var scale: CGFloat { max(imageRect().width / max(crop.width, 1), 0.0001) }
+    var scale: CGFloat { max(imageRect().width / max(viewRegion.width, 1), 0.0001) }
 
     func toImage(_ p: NSPoint) -> CGPoint {
-        let r = imageRect()
-        return CGPoint(x: crop.minX + (p.x - r.minX) / scale, y: crop.minY + (p.y - r.minY) / scale)
+        let r = imageRect(), v = viewRegion
+        return CGPoint(x: v.minX + (p.x - r.minX) / scale, y: v.minY + (p.y - r.minY) / scale)
+    }
+
+    func viewRect(of rr: CGRect) -> NSRect {
+        let r = imageRect(), v = viewRegion, s = scale
+        return NSRect(x: r.minX + (rr.minX - v.minX) * s, y: r.minY + (rr.minY - v.minY) * s,
+                      width: rr.width * s, height: rr.height * s)
     }
 
     // MARK: Geçmiş
@@ -1117,9 +1252,11 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
 
     func undoLast() {
         commitText()
+        if let e = cropEditing, e != crop { cropEditing = crop; return }   // önce kırpma düzenlemesini geri al
         guard let h = history.popLast() else { return }
         marks = h.marks
         crop = h.crop
+        if cropEditing != nil { cropEditing = crop }
     }
 
     func clearAll() {
@@ -1128,6 +1265,101 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         pushHistory()
         marks = []
         crop = fullRect
+        if cropEditing != nil { cropEditing = fullRect }
+    }
+
+    // MARK: Kırpma
+
+    /// Düzenlenen kırpma çerçevesini uygula
+    func applyCrop() {
+        guard let e = cropEditing else { return }
+        cropEditing = nil
+        let n = e.integral.intersection(fullRect)
+        if n != crop && n.width >= 1 && n.height >= 1 { pushHistory(); crop = n }
+    }
+
+    func cropHandle(at vp: NSPoint) -> CropHandle {
+        guard let c = cropEditing else { return .none }
+        let v = viewRect(of: c), t: CGFloat = 10
+        let nL = abs(vp.x - v.minX) <= t, nR = abs(vp.x - v.maxX) <= t
+        let nB = abs(vp.y - v.minY) <= t, nT = abs(vp.y - v.maxY) <= t
+        let inX = vp.x >= v.minX - t && vp.x <= v.maxX + t
+        let inY = vp.y >= v.minY - t && vp.y <= v.maxY + t
+        if nL && nT { return .tl }
+        if nR && nT { return .tr }
+        if nL && nB { return .bl }
+        if nR && nB { return .br }
+        if nL && inY { return .l }
+        if nR && inY { return .r }
+        if nT && inX { return .t }
+        if nB && inX { return .b }
+        if v.contains(vp) { return .move }
+        return .none
+    }
+
+    func dragCrop(to p: CGPoint) {
+        guard let d = cropDrag else { return }
+        let o = d.orig, f = fullRect, minS: CGFloat = 12
+        let dx = p.x - d.start.x, dy = p.y - d.start.y
+        var minX = o.minX, maxX = o.maxX, minY = o.minY, maxY = o.maxY
+        switch d.handle {
+        case .move:
+            let mx = max(f.minX - o.minX, min(f.maxX - o.maxX, dx))
+            let my = max(f.minY - o.minY, min(f.maxY - o.maxY, dy))
+            minX += mx; maxX += mx; minY += my; maxY += my
+        default:
+            if [.l, .tl, .bl].contains(d.handle) { minX = max(f.minX, min(o.maxX - minS, o.minX + dx)) }
+            if [.r, .tr, .br].contains(d.handle) { maxX = min(f.maxX, max(o.minX + minS, o.maxX + dx)) }
+            if [.b, .bl, .br].contains(d.handle) { minY = max(f.minY, min(o.maxY - minS, o.minY + dy)) }
+            if [.t, .tl, .tr].contains(d.handle) { maxY = min(f.maxY, max(o.minY + minS, o.maxY + dy)) }
+        }
+        cropEditing = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    func drawCropOverlay() {
+        guard let c = cropEditing else { return }
+        let ir = imageRect(), v = viewRect(of: c)
+        let dim = NSBezierPath(rect: ir)
+        dim.append(NSBezierPath(rect: v))
+        dim.windingRule = .evenOdd
+        NSColor.black.withAlphaComponent(0.55).setFill(); dim.fill()
+
+        // üçte bir çizgileri
+        let thirds = NSBezierPath()
+        for i in 1...2 {
+            let x = v.minX + v.width * CGFloat(i) / 3, y = v.minY + v.height * CGFloat(i) / 3
+            thirds.move(to: NSPoint(x: x, y: v.minY)); thirds.line(to: NSPoint(x: x, y: v.maxY))
+            thirds.move(to: NSPoint(x: v.minX, y: y)); thirds.line(to: NSPoint(x: v.maxX, y: y))
+        }
+        thirds.lineWidth = 0.5; NSColor.white.withAlphaComponent(0.35).setStroke(); thirds.stroke()
+
+        let border = NSBezierPath(rect: v.insetBy(dx: 0.5, dy: 0.5))
+        border.lineWidth = 1; NSColor.white.withAlphaComponent(0.9).setStroke(); border.stroke()
+
+        // köşe ve kenar tutamaçları
+        let h = NSBezierPath()
+        let L = min(18, v.width / 3, v.height / 3), w: CGFloat = 4
+        for (cx, cy, sx, sy) in [(v.minX, v.minY, 1.0, 1.0), (v.maxX, v.minY, -1.0, 1.0),
+                                 (v.minX, v.maxY, 1.0, -1.0), (v.maxX, v.maxY, -1.0, -1.0)] as [(CGFloat, CGFloat, CGFloat, CGFloat)] {
+            h.move(to: NSPoint(x: cx + sx * L, y: cy)); h.line(to: NSPoint(x: cx, y: cy)); h.line(to: NSPoint(x: cx, y: cy + sy * L))
+        }
+        let m = min(14, v.width / 4, v.height / 4)
+        h.move(to: NSPoint(x: v.midX - m, y: v.minY)); h.line(to: NSPoint(x: v.midX + m, y: v.minY))
+        h.move(to: NSPoint(x: v.midX - m, y: v.maxY)); h.line(to: NSPoint(x: v.midX + m, y: v.maxY))
+        h.move(to: NSPoint(x: v.minX, y: v.midY - m)); h.line(to: NSPoint(x: v.minX, y: v.midY + m))
+        h.move(to: NSPoint(x: v.maxX, y: v.midY - m)); h.line(to: NSPoint(x: v.maxX, y: v.midY + m))
+        h.lineWidth = w; h.lineCapStyle = .square
+        NSColor.white.setStroke(); h.stroke()
+
+        let label = NSAttributedString(string: "\(Int(c.width.rounded())) × \(Int(c.height.rounded()))", attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.white])
+        let sz = label.size()
+        let bg = NSRect(x: v.midX - sz.width / 2 - 6, y: v.minY + 10, width: sz.width + 12, height: sz.height + 4)
+        if bg.maxY < v.maxY - 10 {
+            NSColor.black.withAlphaComponent(0.6).setFill()
+            NSBezierPath(roundedRect: bg, xRadius: 5, yRadius: 5).fill()
+            label.draw(at: NSPoint(x: bg.minX + 6, y: bg.minY + 2))
+        }
     }
 
     // MARK: Efektler
@@ -1161,7 +1393,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
 
     override func draw(_ dirty: NSRect) {
         NSColor(white: 0.13, alpha: 1).setFill(); bounds.fill()
-        let r = imageRect()
+        let r = imageRect(), v = viewRegion
         NSGraphicsContext.saveGraphicsState()
         let sh = NSShadow(); sh.shadowBlurRadius = 12; sh.shadowColor = NSColor.black.withAlphaComponent(0.5)
         sh.set()
@@ -1173,35 +1405,32 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         let t = NSAffineTransform()
         t.translateX(by: r.minX, yBy: r.minY)
         t.scale(by: scale)
-        t.translateX(by: -crop.minX, yBy: -crop.minY)
+        t.translateX(by: -v.minX, yBy: -v.minY)
         t.concat()
         image.draw(in: fullRect)
         drawAll(includeCurrent: true)
 
-        // seçim önizlemeleri
-        if let c = current, let rr = rectOf(c) {
-            if c.tool == .crop {
-                let dim = NSBezierPath(rect: crop.insetBy(dx: -2, dy: -2))
-                dim.append(NSBezierPath(rect: rr))
-                dim.windingRule = .evenOdd
-                NSColor.black.withAlphaComponent(0.5).setFill(); dim.fill()
-            }
-            if c.tool == .pixelate || c.tool == .blur || c.tool == .crop {
-                let p = NSBezierPath(rect: rr); p.lineWidth = 1.5 / scale
-                p.setLineDash([6 / scale, 4 / scale], count: 2, phase: 0)
-                NSColor.white.withAlphaComponent(0.9).setStroke(); p.stroke()
-            }
+        if let c = current, c.tool == .pixelate || c.tool == .blur, let rr = rectOf(c) {
+            let p = NSBezierPath(rect: rr); p.lineWidth = 1.5 / scale
+            p.setLineDash([6 / scale, 4 / scale], count: 2, phase: 0)
+            NSColor.white.withAlphaComponent(0.9).setStroke(); p.stroke()
         }
         NSGraphicsContext.restoreGraphicsState()
+
+        if tool == .crop { drawCropOverlay() }
     }
 
+    /// İşaretler ayrı bir katmana çizilir; böylece silgi sadece işaretleri siler, görseli değil
     func drawAll(includeCurrent: Bool) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
         var n = 0
         for m in marks {
             if m.tool == .number { n += 1 }
             drawMark(m, number: n)
         }
-        if includeCurrent, let c = current, c.tool != .crop { drawMark(c, number: n + 1) }
+        if includeCurrent, let c = current { drawMark(c, number: n + 1) }
+        ctx.endTransparencyLayer()
     }
 
     func rectOf(_ m: Mark) -> NSRect? {
@@ -1215,9 +1444,59 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
                 [.font: f, .foregroundColor: m.color])
     }
 
+    /// Okun izlediği yol: düz okta iki nokta, eğri okta yumuşatılmış el çizimi
+    func arrowPath(_ m: Mark) -> [CGPoint] {
+        guard let f = m.points.first, let l = m.points.last else { return [] }
+        if !m.curved || m.points.count < 3 { return [f, l] }
+        return PathMath.chaikin(PathMath.simplify(m.points, max(m.width * 2.5, 3)), iterations: 4)
+    }
+
+    func arrowHeadSize(_ m: Mark) -> CGFloat {
+        m.arrow == .soft ? max(m.width * 4, 14) : max(m.width * 4.5, 14)
+    }
+
+    func drawArrow(_ m: Mark) {
+        let pts = arrowPath(m)
+        let len = PathMath.length(pts)
+        guard len > 1, let tip0 = pts.last else { return }
+        let head = min(len * 0.6, arrowHeadSize(m))
+        let shaftW = max(m.width * 1.6, head * 0.3)         // gövde kafaya oranla kalın
+        // kafanın yönü: yolun son kısmının yönü
+        let back = PathMath.point(at: max(0, len - head), pts)
+        let dl = max(hypot(tip0.x - back.x, tip0.y - back.y), 0.001)
+        let ux = (tip0.x - back.x) / dl, uy = (tip0.y - back.y) / dl
+        m.color.setStroke(); m.color.setFill()
+
+        let soft = m.arrow == .soft
+        let round = soft ? max(m.width * 1.3, head * 0.45) : 0
+        let tip = CGPoint(x: tip0.x - ux * round / 2, y: tip0.y - uy * round / 2)
+        let headLen = head - round / 2
+        let bx = tip.x - ux * headLen, by = tip.y - uy * headLen
+        let half = head * (soft ? 0.62 : 0.55)
+
+        // gövde: kafanın içine kadar uzanır
+        let shaft = PathMath.prefix(upTo: max(0, len - head * (soft ? 0.55 : 0.75)), pts)
+        let sp = NSBezierPath()
+        sp.lineCapStyle = .round; sp.lineJoinStyle = .round
+        if let s0 = shaft.first {
+            sp.move(to: s0)
+            if shaft.count == 1 { sp.line(to: s0) }
+            for p in shaft.dropFirst() { sp.line(to: p) }
+        }
+        sp.lineWidth = shaftW; sp.stroke()
+
+        let tri = NSBezierPath()
+        tri.lineJoinStyle = .round
+        tri.move(to: tip)
+        tri.line(to: CGPoint(x: bx - uy * half, y: by + ux * half))
+        tri.line(to: CGPoint(x: bx + uy * half, y: by - ux * half))
+        tri.close()
+        tri.fill()
+        if soft { tri.lineWidth = round; tri.stroke() }
+    }
+
     func drawMark(_ m: Mark, number: Int) {
         guard let first = m.points.first else { return }
-        let last = m.points.last!
         let path = NSBezierPath()
         path.lineCapStyle = .round; path.lineJoinStyle = .round
         switch m.tool {
@@ -1233,41 +1512,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             let p = NSBezierPath(roundedRect: rr, xRadius: m.width, yRadius: m.width)
             p.lineWidth = m.width; m.color.setStroke(); p.stroke()
         case .arrow:
-            let dx = last.x - first.x, dy = last.y - first.y
-            let len = hypot(dx, dy); guard len > 1 else { return }
-            let ux = dx / len, uy = dy / len
-            m.color.setStroke(); m.color.setFill()
-            if m.arrow == .soft {
-                // yumuşak ok: daha geniş, köşeleri yuvarlatılmış kafa
-                let head = min(len * 0.6, max(m.width * 4, 14))
-                let round = max(m.width * 1.3, head * 0.45)         // köşe yuvarlaklığı
-                let tip = CGPoint(x: last.x - ux * round / 2, y: last.y - uy * round / 2)
-                let bx = tip.x - ux * (head - round / 2), by = tip.y - uy * (head - round / 2)
-                let half = head * 0.62
-                path.move(to: first)
-                path.line(to: CGPoint(x: bx + ux * head * 0.3, y: by + uy * head * 0.3))
-                path.lineWidth = m.width; path.stroke()
-                let tri = NSBezierPath()
-                tri.lineJoinStyle = .round
-                tri.move(to: tip)
-                tri.line(to: CGPoint(x: bx - uy * half, y: by + ux * half))
-                tri.line(to: CGPoint(x: bx + uy * half, y: by - ux * half))
-                tri.close()
-                tri.lineWidth = round
-                tri.fill(); tri.stroke()
-            } else {
-                // sivri ok
-                let head = min(len * 0.6, max(m.width * 4.5, 14))
-                let base = CGPoint(x: last.x - ux * head * 0.8, y: last.y - uy * head * 0.8)
-                path.move(to: first); path.line(to: base)
-                path.lineWidth = m.width; path.stroke()
-                let tri = NSBezierPath()
-                let bx = last.x - ux * head, by = last.y - uy * head
-                tri.move(to: last)
-                tri.line(to: CGPoint(x: bx - uy * head * 0.55, y: by + ux * head * 0.55))
-                tri.line(to: CGPoint(x: bx + uy * head * 0.55, y: by - ux * head * 0.55))
-                tri.close(); tri.fill()
-            }
+            drawArrow(m)
         case .pixelate, .blur:
             guard let rr = rectOf(m), let fx = (m.tool == .pixelate ? pixelated : blurred) else { return }
             NSGraphicsContext.saveGraphicsState()
@@ -1294,20 +1539,26 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
                 .foregroundColor: AnnotationView.contrast(for: m.color)])
             let sz = s.size()
             s.draw(at: NSPoint(x: first.x - sz.width / 2, y: first.y - sz.height / 2))
-        case .eraser, .crop:
+        case .eraser:
+            // kısmi silgi: işaret katmanındaki pikselleri temizler (görsel etkilenmez)
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+            let cp = CGMutablePath()
+            cp.move(to: first)
+            if m.points.count == 1 { cp.addLine(to: CGPoint(x: first.x + 0.1, y: first.y)) }
+            for p in m.points.dropFirst() { cp.addLine(to: p) }
+            ctx.saveGState()
+            ctx.setBlendMode(.clear)
+            ctx.setLineWidth(m.width)
+            ctx.setLineCap(.round); ctx.setLineJoin(.round)
+            ctx.addPath(cp)
+            ctx.strokePath()
+            ctx.restoreGState()
+        case .crop:
             break
         }
     }
 
-    // MARK: Silgi
-
-    static func segDist(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
-        let dx = b.x - a.x, dy = b.y - a.y
-        let l2 = dx * dx + dy * dy
-        if l2 < 0.0001 { return hypot(p.x - a.x, p.y - a.y) }
-        let t = max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2))
-        return hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy))
-    }
+    // MARK: Silgi (bütün işaret)
 
     /// p noktası (görsel pikseli) bu işarete değiyor mu
     func hit(_ m: Mark, _ p: CGPoint, tol: CGFloat) -> Bool {
@@ -1315,13 +1566,12 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         switch m.tool {
         case .pen, .marker:
             let half = (m.tool == .marker ? m.width * 4 : m.width) / 2 + tol
-            if m.points.count == 1 { return hypot(p.x - first.x, p.y - first.y) <= half }
-            for i in 1..<m.points.count where AnnotationView.segDist(p, m.points[i - 1], m.points[i]) <= half { return true }
-            return false
+            return PathMath.polyDist(p, m.points) <= half
         case .arrow:
-            guard let last = m.points.last else { return false }
-            return AnnotationView.segDist(p, first, last) <= max(m.width * 2.5, m.width / 2 + tol)
-                || hypot(p.x - last.x, p.y - last.y) <= max(m.width * 3, 14) + tol
+            let pts = arrowPath(m)
+            guard let last = pts.last else { return false }
+            return PathMath.polyDist(p, pts) <= max(m.width * 1.6, arrowHeadSize(m) * 0.3) / 2 + tol
+                || hypot(p.x - last.x, p.y - last.y) <= arrowHeadSize(m) * 0.7 + tol
         case .rect:
             guard let rr = rectOf(m) else { return false }
             let outer = rr.insetBy(dx: -(m.width / 2 + tol), dy: -(m.width / 2 + tol))
@@ -1341,7 +1591,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         }
     }
 
-    func eraseAt(_ p: CGPoint) {
+    func eraseWholeAt(_ p: CGPoint) {
         let tol = eraserRadius / scale
         let kept = marks.filter { !hit($0, p, tol: tol) }
         guard kept.count != marks.count else { return }
@@ -1363,34 +1613,49 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             pushHistory()
             marks.append(Mark(tool: .number, color: color, width: (18 + lineWidth * 2) / scale, points: [p]))
         case .eraser:
-            erasedThisDrag = false
-            eraseAt(p)
+            if eraserMode == .whole {
+                erasedThisDrag = false
+                eraseWholeAt(p)
+            } else {
+                current = Mark(tool: .eraser, color: .clear, width: eraserRadius * 2 / scale, points: [p])
+            }
+        case .crop:
+            let h = cropHandle(at: vp)
+            if h != .none, let c = cropEditing {
+                cropDrag = (h, p, c)
+                if h == .move { NSCursor.closedHand.set() }
+            }
         default:
-            current = Mark(tool: tool, color: color, width: lineWidth / scale, points: [p], arrow: arrowStyle)
+            current = Mark(tool: tool, color: color, width: lineWidth / scale, points: [p],
+                           arrow: arrowStyle, curved: arrowCurved)
         }
     }
     override func mouseDragged(with e: NSEvent) {
         let p = toImage(convert(e.locationInWindow, from: nil))
-        if tool == .eraser { eraseAt(p); return }
+        switch tool {
+        case .eraser where eraserMode == .whole: eraseWholeAt(p); return
+        case .crop: dragCrop(to: p); return
+        default: break
+        }
         guard var c = current else { return }
-        if c.tool == .pen || c.tool == .marker { c.points.append(p) }
-        else { c.points = [c.points[0], p] }
+        if c.tool == .pen || c.tool == .marker || c.tool == .eraser || (c.tool == .arrow && c.curved) {
+            c.points.append(p)
+        } else {
+            c.points = [c.points[0], p]
+        }
         current = c
     }
     override func mouseUp(with e: NSEvent) {
-        if tool == .eraser { erasedThisDrag = false; return }
+        if tool == .crop { cropDrag = nil; window?.invalidateCursorRects(for: self); return }
+        if tool == .eraser && eraserMode == .whole { erasedThisDrag = false; return }
         guard let c = current else { return }
         current = nil
-        if c.tool == .crop {
-            guard let rr = rectOf(c) else { return }
-            let newCrop = rr.intersection(crop).integral.intersection(fullRect)
-            guard newCrop.width * scale >= 8, newCrop.height * scale >= 8 else { return }
-            pushHistory()
-            crop = newCrop
-            onCropped?()
-            return
-        }
-        if c.tool != .pen && c.tool != .marker {
+        switch c.tool {
+        case .pen, .marker, .eraser:
+            break
+        case .arrow:
+            guard PathMath.length(c.points) > 3 / scale else { return }
+        default:
             guard let rr = rectOf(c), hypot(rr.width, rr.height) > 3 / scale else { return }
         }
         pushHistory()
@@ -1418,12 +1683,15 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         editor = f
     }
 
-    func controlTextDidChange(_ n: Notification) {
+    func resizeEditor() {
         guard let f = editor else { return }
+        let minY = f.frame.minY, minX = f.frame.minX
         f.sizeToFit()
         let w = f.attributedStringValue.size().width + 24
-        f.setFrameSize(NSSize(width: max(180, w), height: f.frame.height))
+        f.frame = NSRect(x: minX, y: minY, width: max(180, w), height: f.frame.height)
     }
+
+    func controlTextDidChange(_ n: Notification) { resizeEditor() }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
         if sel == #selector(NSResponder.insertNewline(_:)) { commitText(); return true }
@@ -1452,6 +1720,15 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
 
     // MARK: Klavye
 
+    override func keyDown(with e: NSEvent) {
+        if tool == .crop, cropEditing != nil, e.keyCode == 36 || e.keyCode == 76 {   // Enter: kırpmayı uygula
+            applyCrop()
+            onCropped?(true)
+            return
+        }
+        super.keyDown(with: e)
+    }
+
     override func performKeyEquivalent(with e: NSEvent) -> Bool {
         if editor != nil { return super.performKeyEquivalent(with: e) }  // yazı yazarken ⌘C/⌘V yazı kutusuna
         guard e.modifierFlags.contains(.command), let ch = e.charactersIgnoringModifiers?.lowercased() else {
@@ -1464,11 +1741,20 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         default: return super.performKeyEquivalent(with: e)
         }
     }
-    override func cancelOperation(_ sender: Any?) { window?.performClose(nil) }
+
+    override func cancelOperation(_ sender: Any?) {
+        if tool == .crop, cropEditing != nil {        // Esc: kırpmadan vazgeç
+            cropEditing = crop
+            onCropped?(false)
+            return
+        }
+        window?.performClose(nil)
+    }
 
     /// İşaretlenmiş (ve kırpılmış) görseli tam çözünürlükte PNG olarak üretir
     func renderPNG() -> Data? {
         commitText()
+        applyCrop()
         let w = Int(crop.width.rounded()), h = Int(crop.height.rounded())
         guard w > 0, h > 0,
               let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
@@ -1482,6 +1768,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         image.draw(in: fullRect)
         drawAll(includeCurrent: false)
         NSGraphicsContext.restoreGraphicsState()
+        if tool == .crop { cropEditing = crop }
         return rep.representation(using: .png, properties: [:])
     }
 }
@@ -1500,11 +1787,18 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
 
     static let palette: [NSColor] = [.systemRed, .systemOrange, .systemYellow, .systemGreen,
                                      .systemBlue, .systemPurple, .black, .white]
-    static let tools: [(label: String, tip: String)] = [
-        ("✏️", "Kalem"), ("↗", "Ok: tıklayınca sivri / yumuşak seç"), ("▢", "Kutu"), ("🖍", "Fosforlu kalem"),
-        ("T", "Yazı: tıklayınca font seç; resme tıkla, yaz, Enter"), ("①", "Numaralı işaret: her tık 1, 2, 3…"),
-        ("▦", "Pikselleştir: alanı sürükleyerek seç"), ("◌", "Bulanıklaştır: alanı sürükleyerek seç"),
-        ("⌫", "Silgi: üzerinden geçtiğin işaretleri siler"), ("✂︎", "Kırp: tutmak istediğin alanı seç")]
+    /// label: yedek metin; symbol: varsa kullanılacak SF Symbol
+    static let tools: [(label: String, symbol: String?, tip: String)] = [
+        ("✏️", nil, "Kalem"),
+        ("↗", nil, "Ok: tıklayınca sivri/yumuşak ve düz/eğri seç"),
+        ("▢", nil, "Kutu"),
+        ("🖍", nil, "Fosforlu kalem"),
+        ("T", nil, "Yazı: tıklayınca font seç; resme tıkla, yaz, Enter"),
+        ("①", nil, "Numaralı işaret: her tık 1, 2, 3…"),
+        ("▦", nil, "Pikselleştir: alanı sürükleyerek seç"),
+        ("◌", nil, "Bulanıklaştır: alanı sürükleyerek seç"),
+        ("Silgi", "eraser", "Silgi: tıklayınca bütün işaret / sadece dokunduğun yer seç"),
+        ("Kırp", "crop", "Kırp: kenarları sürükle, Enter ile uygula")]
 
     init(image: NSImage, onClose: @escaping (AnnotationWindowController) -> Void, onSaved: @escaping () -> Void) {
         let cv = AnnotationView(image: image)
@@ -1514,8 +1808,8 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let ptSize = NSSize(width: cv.pixelSize.width / 2, height: cv.pixelSize.height / 2)
         let maxW = screen.width * 0.85, maxH = screen.height * 0.85 - 56
-        let s = min(1, maxW / max(ptSize.width + 32, 1), maxH / max(ptSize.height + 32, 1))
-        let size = NSSize(width: max(1000, (ptSize.width + 32) * s), height: max(440, (ptSize.height + 32) * s + 56))
+        let s = min(1, maxW / max(ptSize.width + 40, 1), maxH / max(ptSize.height + 40, 1))
+        let size = NSSize(width: max(1000, (ptSize.width + 40) * s), height: max(440, (ptSize.height + 40) * s + 56))
 
         let win = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                            styleMask: [.titled, .closable, .resizable, .miniaturizable],
@@ -1531,12 +1825,12 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         canvas.onCommand = { [weak self] cmd in
             if cmd == "undo" { self?.undo() } else { self?.save() }
         }
-        canvas.onCropped = { [weak self] in
-            // kırptıktan sonra son çizim aracına dön
+        canvas.onCropped = { [weak self] applied in
+            // Enter / Esc sonrası son çizim aracına dön
             guard let self = self else { return }
             self.toolControl.selectedSegment = self.lastDrawTool.rawValue
             self.canvas.tool = self.lastDrawTool
-            self.status.stringValue = "Kırpıldı ✓ (Geri Al ile eski haline dönebilirsin)"
+            self.status.stringValue = applied ? "Kırpıldı ✓ (Geri Al ile eski haline dönebilirsin)" : ""
         }
         canvas.onChange?()
     }
@@ -1547,7 +1841,13 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
 
         let tools = NSSegmentedControl(labels: Self.tools.map { $0.label },
                                        trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
-        for (i, t) in Self.tools.enumerated() { tools.setToolTip(t.tip, forSegment: i) }
+        for (i, t) in Self.tools.enumerated() {
+            tools.setToolTip(t.tip, forSegment: i)
+            if let name = t.symbol, let img = NSImage(systemSymbolName: name, accessibilityDescription: t.label) {
+                tools.setImage(img, forSegment: i)
+                tools.setLabel("", forSegment: i)
+            }
+        }
         tools.selectedSegment = 0
         toolControl = tools
 
@@ -1567,7 +1867,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         let slider = NSSlider(value: 4, minValue: 1, maxValue: 16, target: self, action: #selector(widthChanged(_:)))
         slider.translatesAutoresizingMaskIntoConstraints = false
         slider.widthAnchor.constraint(equalToConstant: 80).isActive = true
-        slider.toolTip = "Kalınlık / yazı boyu / numara boyu"
+        slider.toolTip = "Kalınlık / yazı boyu / numara boyu / silgi boyu"
 
         undoButton.target = self; undoButton.action = #selector(undo); undoButton.bezelStyle = .rounded
         undoButton.toolTip = "⌘Z"
@@ -1611,12 +1911,15 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
     @objc func toolChanged(_ s: NSSegmentedControl) {
         let t = Tool(rawValue: s.selectedSegment) ?? .pen
         canvas.tool = t
+        window?.makeFirstResponder(canvas)
         if t != .crop && t != .eraser { lastDrawTool = t }
         switch t {
         case .arrow: popUpMenu(arrowMenu(), under: s, segment: s.selectedSegment)
         case .text: popUpMenu(fontMenu(), under: s, segment: s.selectedSegment)
-        case .crop: status.stringValue = "Tutmak istediğin alanı sürükleyerek seç"
-        case .eraser: status.stringValue = "Silmek istediğin işaretlerin üzerinden geç"
+        case .eraser:
+            status.stringValue = ""
+            popUpMenu(eraserMenu(), under: s, segment: s.selectedSegment)
+        case .crop: status.stringValue = "Kenarları ya da köşeleri sürükle · Enter: uygula · Esc: vazgeç"
         default: status.stringValue = ""
         }
     }
@@ -1629,30 +1932,42 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         menu.popUp(positioning: nil, at: NSPoint(x: x, y: y), in: s)
     }
 
+    func menuItem(_ title: String, _ action: Selector, tag: Int, on: Bool) -> NSMenuItem {
+        let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        i.target = self; i.tag = tag; i.state = on ? .on : .off
+        return i
+    }
+
     func arrowMenu() -> NSMenu {
         let m = NSMenu()
-        for (title, style) in [("↗  Sivri Ok", ArrowStyle.sharp), ("➚  Yumuşak Ok", ArrowStyle.soft)] {
-            let i = NSMenuItem(title: title, action: #selector(setArrowStyle(_:)), keyEquivalent: "")
-            i.target = self; i.tag = style.rawValue
-            i.state = canvas.arrowStyle == style ? .on : .off
-            m.addItem(i)
-        }
+        m.addItem(menuItem("Sivri Ok", #selector(setArrowStyle(_:)), tag: 0, on: canvas.arrowStyle == .sharp))
+        m.addItem(menuItem("Yumuşak Ok", #selector(setArrowStyle(_:)), tag: 1, on: canvas.arrowStyle == .soft))
+        m.addItem(.separator())
+        m.addItem(menuItem("Düz", #selector(setArrowShape(_:)), tag: 0, on: !canvas.arrowCurved))
+        m.addItem(menuItem("Eğri (çizdiğim gibi)", #selector(setArrowShape(_:)), tag: 1, on: canvas.arrowCurved))
+        return m
+    }
+
+    func eraserMenu() -> NSMenu {
+        let m = NSMenu()
+        m.addItem(menuItem("Bütün işareti sil", #selector(setEraserMode(_:)), tag: 0, on: canvas.eraserMode == .whole))
+        m.addItem(menuItem("Sadece dokunduğum yeri sil", #selector(setEraserMode(_:)), tag: 1, on: canvas.eraserMode == .partial))
         return m
     }
 
     func fontMenu() -> NSMenu {
         let m = NSMenu()
         for f in TextFont.allCases {
-            let i = NSMenuItem(title: f.title, action: #selector(setTextFont(_:)), keyEquivalent: "")
+            let i = menuItem(f.title, #selector(setTextFont(_:)), tag: f.rawValue, on: canvas.textFont == f)
             i.attributedTitle = NSAttributedString(string: f.title, attributes: [.font: f.font(size: 14)])
-            i.target = self; i.tag = f.rawValue
-            i.state = canvas.textFont == f ? .on : .off
             m.addItem(i)
         }
         return m
     }
 
     @objc func setArrowStyle(_ i: NSMenuItem) { canvas.arrowStyle = ArrowStyle(rawValue: i.tag) ?? .sharp }
+    @objc func setArrowShape(_ i: NSMenuItem) { canvas.arrowCurved = i.tag == 1 }
+    @objc func setEraserMode(_ i: NSMenuItem) { canvas.eraserMode = EraserMode(rawValue: i.tag) ?? .whole }
     @objc func setTextFont(_ i: NSMenuItem) { canvas.textFont = TextFont(rawValue: i.tag) ?? .rounded }
 
     @objc func colorChanged(_ b: NSButton) {

@@ -20,7 +20,9 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 
 **İşaretleme**
 - Gözlere tıkla → *Panodaki Görseli Aç ve İşaretle*
-- Kalem, ok (sivri / yumuşak), kutu, fosforlu kalem, yazı (Yuvarlak / Montserrat / Sans Serif), numaralı işaret, pikselleştirme, bulanıklaştırma, silgi, kırpma
+- Kalem, ok (sivri / yumuşak, düz / eğri), kutu, fosforlu kalem, yazı (Yuvarlak / Montserrat / Sans Serif), numaralı işaret, pikselleştirme, bulanıklaştırma
+- Silgi: bütün işareti ya da sadece dokunulan yeri siler
+- Kırpma: kenar ve köşeleri sürükle, Enter ile uygula
 - ⌘S: panoya kopyalar ve masaüstüne kaydeder · ⌘Z: geri alır
 
 ## Kurulum
