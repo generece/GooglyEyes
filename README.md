@@ -20,7 +20,7 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 
 **İşaretleme**
 - Gözlere tıkla → *Panodaki Görseli Aç ve İşaretle*
-- Kalem, ok, kutu, fosforlu kalem, yazı, numaralı işaret, pikselleştirme, bulanıklaştırma
+- Kalem, ok (sivri / yumuşak), kutu, fosforlu kalem, yazı (Yuvarlak / Montserrat / Sans Serif), numaralı işaret, pikselleştirme, bulanıklaştırma, silgi, kırpma
 - ⌘S: panoya kopyalar ve masaüstüne kaydeder · ⌘Z: geri alır
 
 ## Kurulum
@@ -49,4 +49,4 @@ Script uygulamayı derler, sabit bir yerel sertifikayla imzalar (böylece Ekran 
 | `main.swift` | Uygulamanın tamamı (AppKit) |
 | `build.sh` | Derleme, imzalama, kurulum |
 | `Info.plist` | Uygulama bilgileri |
-| `Resources/` | Göz dokuları (göz akı, göz bebeği, parlama, kapak, spiral) ve ikon |
+| `Resources/` | Göz dokuları (göz akı, göz bebeği, parlama, kapak, spiral), ikon ve Montserrat Bold (SIL Open Font License, `Montserrat-OFL.txt`) |

@@ -5,6 +5,7 @@ import ServiceManagement
 import CoreImage
 import ScreenCaptureKit
 import ApplicationServices
+import CoreText
 
 // MARK: - Dokular
 
@@ -970,7 +971,43 @@ enum Output {
 
 // MARK: - İşaretleme görünümü
 
-enum Tool: Int { case pen, arrow, rect, marker, text, number, pixelate, blur }
+enum Tool: Int { case pen, arrow, rect, marker, text, number, pixelate, blur, eraser, crop }
+
+/// Yazı aracı için font seçenekleri
+enum TextFont: Int, CaseIterable {
+    case rounded, montserrat, sans
+
+    var title: String {
+        switch self {
+        case .rounded: return "Yuvarlak"
+        case .montserrat: return "Montserrat"
+        case .sans: return "Sans Serif"
+        }
+    }
+
+    /// Uygulamanın içine gömülü Montserrat'ı bir kez kaydet
+    static let registerOnce: Void = {
+        if let url = Bundle.main.url(forResource: "Montserrat-Bold", withExtension: "ttf") {
+            CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+        }
+    }()
+
+    func font(size: CGFloat) -> NSFont {
+        switch self {
+        case .rounded:
+            let base = NSFont.systemFont(ofSize: size, weight: .heavy)
+            if let d = base.fontDescriptor.withDesign(.rounded), let f = NSFont(descriptor: d, size: size) { return f }
+            return base
+        case .montserrat:
+            _ = TextFont.registerOnce
+            return NSFont(name: "Montserrat-Bold", size: size) ?? TextFont.sans.font(size: size)
+        case .sans:
+            return NSFont(name: "HelveticaNeue-Bold", size: size) ?? NSFont.boldSystemFont(ofSize: size)
+        }
+    }
+}
+
+enum ArrowStyle: Int { case sharp, soft }
 
 struct Mark {
     var tool: Tool
@@ -978,22 +1015,42 @@ struct Mark {
     var width: CGFloat          // görsel pikseli: çizgi kalınlığı / yazı boyu / numara çapı
     var points: [CGPoint]       // görsel pikseli cinsinden (sol-alt orijin)
     var text: String = ""
+    var font: TextFont = .rounded
+    var arrow: ArrowStyle = .sharp
 }
 
 final class AnnotationView: NSView, NSTextFieldDelegate {
     let image: NSImage
     let pixelSize: CGSize
     var marks: [Mark] = [] { didSet { needsDisplay = true; onChange?() } }
+    /// Kırpılmış alan (görsel pikseli). Başlangıçta görselin tamamı.
+    var crop: CGRect = .zero { didSet { needsDisplay = true; window?.invalidateCursorRects(for: self); onChange?() } }
+    /// Geri Al geçmişi: her değişiklikten önceki işaretler + kırpma
+    var history: [(marks: [Mark], crop: CGRect)] = [] { didSet { onChange?() } }
     var current: Mark? { didSet { needsDisplay = true } }
     var tool: Tool = .pen { didSet { commitText(); window?.invalidateCursorRects(for: self) } }
     var color: NSColor = .systemRed
     var lineWidth: CGFloat = 4      // ekran noktası cinsinden
+    var textFont = TextFont(rawValue: UserDefaults.standard.integer(forKey: "textFont")) ?? .rounded {
+        didSet {
+            UserDefaults.standard.set(textFont.rawValue, forKey: "textFont")
+            if let f = editor { f.font = textFont.font(size: editorFontPx * scale); controlTextDidChange(Notification(name: .init(""))) }
+        }
+    }
+    var arrowStyle = ArrowStyle(rawValue: UserDefaults.standard.integer(forKey: "arrowStyle")) ?? .sharp {
+        didSet { UserDefaults.standard.set(arrowStyle.rawValue, forKey: "arrowStyle") }
+    }
     var onChange: (() -> Void)?
     var onCommand: ((String) -> Void)?
+    var onCropped: (() -> Void)?
 
     // yazı aracı
     var editor: NSTextField?
     var editorFontPx: CGFloat = 0
+
+    // silgi
+    var erasedThisDrag = false
+    let eraserRadius: CGFloat = 9   // ekran noktası
 
     lazy var pixelated: NSImage? = makeEffect(.pixelate)
     lazy var blurred: NSImage? = makeEffect(.blur)
@@ -1004,26 +1061,76 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             .max { $0.width < $1.width } ?? .zero
         pixelSize = px.width > 0 ? px : CGSize(width: image.size.width * 2, height: image.size.height * 2)
         super.init(frame: .zero)
+        crop = fullRect
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func resetCursorRects() { addCursorRect(imageRect(), cursor: tool == .text ? .iBeam : .crosshair) }
+    override func resetCursorRects() {
+        let c: NSCursor
+        switch tool {
+        case .text: c = .iBeam
+        case .eraser: c = eraserCursor
+        default: c = .crosshair
+        }
+        addCursorRect(imageRect(), cursor: c)
+    }
 
+    lazy var eraserCursor: NSCursor = {
+        let d = eraserRadius * 2 + 2
+        let img = NSImage(size: NSSize(width: d, height: d), flipped: false) { r in
+            let o = NSBezierPath(ovalIn: r.insetBy(dx: 1, dy: 1))
+            NSColor.white.withAlphaComponent(0.35).setFill(); o.fill()
+            o.lineWidth = 2; NSColor.black.withAlphaComponent(0.8).setStroke(); o.stroke()
+            o.lineWidth = 1; NSColor.white.setStroke(); o.stroke()
+            return true
+        }
+        return NSCursor(image: img, hotSpot: NSPoint(x: d / 2, y: d / 2))
+    }()
+
+    // MARK: Koordinatlar
+
+    var fullRect: NSRect { NSRect(origin: .zero, size: pixelSize) }
+
+    /// Kırpılmış alanın penceredeki yeri
     func imageRect() -> NSRect {
         let b = bounds.insetBy(dx: 16, dy: 16)
-        let s = min(b.width / pixelSize.width, b.height / pixelSize.height)
-        let w = pixelSize.width * s, h = pixelSize.height * s
+        let cw = max(crop.width, 1), ch = max(crop.height, 1)
+        let s = min(b.width / cw, b.height / ch)
+        let w = cw * s, h = ch * s
         return NSRect(x: b.midX - w / 2, y: b.midY - h / 2, width: w, height: h)
     }
-    var scale: CGFloat { max(imageRect().width / pixelSize.width, 0.0001) }
-    var fullRect: NSRect { NSRect(origin: .zero, size: pixelSize) }
+    var scale: CGFloat { max(imageRect().width / max(crop.width, 1), 0.0001) }
 
     func toImage(_ p: NSPoint) -> CGPoint {
         let r = imageRect()
-        return CGPoint(x: (p.x - r.minX) / scale, y: (p.y - r.minY) / scale)
+        return CGPoint(x: crop.minX + (p.x - r.minX) / scale, y: crop.minY + (p.y - r.minY) / scale)
     }
+
+    // MARK: Geçmiş
+
+    func pushHistory() {
+        history.append((marks, crop))
+        if history.count > 300 { history.removeFirst() }
+    }
+
+    func undoLast() {
+        commitText()
+        guard let h = history.popLast() else { return }
+        marks = h.marks
+        crop = h.crop
+    }
+
+    func clearAll() {
+        cancelText()
+        guard !marks.isEmpty || crop != fullRect else { return }
+        pushHistory()
+        marks = []
+        crop = fullRect
+    }
+
+    // MARK: Efektler
 
     func makeEffect(_ kind: Tool) -> NSImage? {
         guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
@@ -1044,16 +1151,13 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         return NSImage(cgImage: res, size: pixelSize)
     }
 
-    static func font(size: CGFloat) -> NSFont {
-        let base = NSFont.systemFont(ofSize: size, weight: .heavy)
-        if let d = base.fontDescriptor.withDesign(.rounded), let f = NSFont(descriptor: d, size: size) { return f }
-        return base
-    }
     static func contrast(for c: NSColor) -> NSColor {
         let rgb = c.usingColorSpace(.sRGB) ?? c
         let lum = 0.299 * rgb.redComponent + 0.587 * rgb.greenComponent + 0.114 * rgb.blueComponent
         return lum > 0.6 ? .black : .white
     }
+
+    // MARK: Çizim
 
     override func draw(_ dirty: NSRect) {
         NSColor(white: 0.13, alpha: 1).setFill(); bounds.fill()
@@ -1061,17 +1165,32 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         NSGraphicsContext.saveGraphicsState()
         let sh = NSShadow(); sh.shadowBlurRadius = 12; sh.shadowColor = NSColor.black.withAlphaComponent(0.5)
         sh.set()
-        image.draw(in: r)
+        NSColor.black.setFill(); r.fill()
         NSGraphicsContext.restoreGraphicsState()
 
         NSGraphicsContext.saveGraphicsState()
         NSBezierPath(rect: r).addClip()
-        let t = NSAffineTransform(); t.translateX(by: r.minX, yBy: r.minY); t.scale(by: scale); t.concat()
+        let t = NSAffineTransform()
+        t.translateX(by: r.minX, yBy: r.minY)
+        t.scale(by: scale)
+        t.translateX(by: -crop.minX, yBy: -crop.minY)
+        t.concat()
+        image.draw(in: fullRect)
         drawAll(includeCurrent: true)
-        if let c = current, c.tool == .pixelate || c.tool == .blur, let rr = rectOf(c) {
-            let p = NSBezierPath(rect: rr); p.lineWidth = 1.5 / scale
-            p.setLineDash([6 / scale, 4 / scale], count: 2, phase: 0)
-            NSColor.white.withAlphaComponent(0.9).setStroke(); p.stroke()
+
+        // seçim önizlemeleri
+        if let c = current, let rr = rectOf(c) {
+            if c.tool == .crop {
+                let dim = NSBezierPath(rect: crop.insetBy(dx: -2, dy: -2))
+                dim.append(NSBezierPath(rect: rr))
+                dim.windingRule = .evenOdd
+                NSColor.black.withAlphaComponent(0.5).setFill(); dim.fill()
+            }
+            if c.tool == .pixelate || c.tool == .blur || c.tool == .crop {
+                let p = NSBezierPath(rect: rr); p.lineWidth = 1.5 / scale
+                p.setLineDash([6 / scale, 4 / scale], count: 2, phase: 0)
+                NSColor.white.withAlphaComponent(0.9).setStroke(); p.stroke()
+            }
         }
         NSGraphicsContext.restoreGraphicsState()
     }
@@ -1082,12 +1201,18 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             if m.tool == .number { n += 1 }
             drawMark(m, number: n)
         }
-        if includeCurrent, let c = current { drawMark(c, number: n + 1) }
+        if includeCurrent, let c = current, c.tool != .crop { drawMark(c, number: n + 1) }
     }
 
     func rectOf(_ m: Mark) -> NSRect? {
         guard let a = m.points.first, let b = m.points.last, m.points.count > 1 else { return nil }
         return NSRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(b.x - a.x), height: abs(b.y - a.y))
+    }
+
+    func textAttributes(_ m: Mark) -> (outline: [NSAttributedString.Key: Any], fill: [NSAttributedString.Key: Any]) {
+        let f = m.font.font(size: m.width)
+        return ([.font: f, .strokeColor: AnnotationView.contrast(for: m.color), .strokeWidth: 14],
+                [.font: f, .foregroundColor: m.color])
     }
 
     func drawMark(_ m: Mark, number: Int) {
@@ -1111,16 +1236,38 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             let dx = last.x - first.x, dy = last.y - first.y
             let len = hypot(dx, dy); guard len > 1 else { return }
             let ux = dx / len, uy = dy / len
-            let head = min(len * 0.6, max(m.width * 4.5, 14))
-            let base = CGPoint(x: last.x - ux * head * 0.8, y: last.y - uy * head * 0.8)
-            path.move(to: first); path.line(to: base)
-            path.lineWidth = m.width; m.color.setStroke(); path.stroke()
-            let tri = NSBezierPath()
-            let bx = last.x - ux * head, by = last.y - uy * head
-            tri.move(to: last)
-            tri.line(to: CGPoint(x: bx - uy * head * 0.55, y: by + ux * head * 0.55))
-            tri.line(to: CGPoint(x: bx + uy * head * 0.55, y: by - ux * head * 0.55))
-            tri.close(); m.color.setFill(); tri.fill()
+            m.color.setStroke(); m.color.setFill()
+            if m.arrow == .soft {
+                // yumuşak ok: daha geniş, köşeleri yuvarlatılmış kafa
+                let head = min(len * 0.6, max(m.width * 4, 14))
+                let round = max(m.width * 1.3, head * 0.45)         // köşe yuvarlaklığı
+                let tip = CGPoint(x: last.x - ux * round / 2, y: last.y - uy * round / 2)
+                let bx = tip.x - ux * (head - round / 2), by = tip.y - uy * (head - round / 2)
+                let half = head * 0.62
+                path.move(to: first)
+                path.line(to: CGPoint(x: bx + ux * head * 0.3, y: by + uy * head * 0.3))
+                path.lineWidth = m.width; path.stroke()
+                let tri = NSBezierPath()
+                tri.lineJoinStyle = .round
+                tri.move(to: tip)
+                tri.line(to: CGPoint(x: bx - uy * half, y: by + ux * half))
+                tri.line(to: CGPoint(x: bx + uy * half, y: by - ux * half))
+                tri.close()
+                tri.lineWidth = round
+                tri.fill(); tri.stroke()
+            } else {
+                // sivri ok
+                let head = min(len * 0.6, max(m.width * 4.5, 14))
+                let base = CGPoint(x: last.x - ux * head * 0.8, y: last.y - uy * head * 0.8)
+                path.move(to: first); path.line(to: base)
+                path.lineWidth = m.width; path.stroke()
+                let tri = NSBezierPath()
+                let bx = last.x - ux * head, by = last.y - uy * head
+                tri.move(to: last)
+                tri.line(to: CGPoint(x: bx - uy * head * 0.55, y: by + ux * head * 0.55))
+                tri.line(to: CGPoint(x: bx + uy * head * 0.55, y: by - ux * head * 0.55))
+                tri.close(); tri.fill()
+            }
         case .pixelate, .blur:
             guard let rr = rectOf(m), let fx = (m.tool == .pixelate ? pixelated : blurred) else { return }
             NSGraphicsContext.saveGraphicsState()
@@ -1128,12 +1275,9 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             fx.draw(in: fullRect)
             NSGraphicsContext.restoreGraphicsState()
         case .text:
-            let f = AnnotationView.font(size: m.width)
-            let outline: [NSAttributedString.Key: Any] = [
-                .font: f, .strokeColor: AnnotationView.contrast(for: m.color), .strokeWidth: 14]
-            let fill: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: m.color]
-            NSAttributedString(string: m.text, attributes: outline).draw(at: first)
-            NSAttributedString(string: m.text, attributes: fill).draw(at: first)
+            let a = textAttributes(m)
+            NSAttributedString(string: m.text, attributes: a.outline).draw(at: first)
+            NSAttributedString(string: m.text, attributes: a.fill).draw(at: first)
         case .number:
             let d = m.width
             let circle = NSRect(x: first.x - d / 2, y: first.y - d / 2, width: d, height: d)
@@ -1146,11 +1290,63 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             let ring = NSBezierPath(ovalIn: circle.insetBy(dx: d * 0.04, dy: d * 0.04))
             ring.lineWidth = d * 0.08; NSColor.white.setStroke(); ring.stroke()
             let s = NSAttributedString(string: "\(number)", attributes: [
-                .font: AnnotationView.font(size: d * 0.55),
+                .font: TextFont.rounded.font(size: d * 0.55),
                 .foregroundColor: AnnotationView.contrast(for: m.color)])
             let sz = s.size()
             s.draw(at: NSPoint(x: first.x - sz.width / 2, y: first.y - sz.height / 2))
+        case .eraser, .crop:
+            break
         }
+    }
+
+    // MARK: Silgi
+
+    static func segDist(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let l2 = dx * dx + dy * dy
+        if l2 < 0.0001 { return hypot(p.x - a.x, p.y - a.y) }
+        let t = max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2))
+        return hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy))
+    }
+
+    /// p noktası (görsel pikseli) bu işarete değiyor mu
+    func hit(_ m: Mark, _ p: CGPoint, tol: CGFloat) -> Bool {
+        guard let first = m.points.first else { return false }
+        switch m.tool {
+        case .pen, .marker:
+            let half = (m.tool == .marker ? m.width * 4 : m.width) / 2 + tol
+            if m.points.count == 1 { return hypot(p.x - first.x, p.y - first.y) <= half }
+            for i in 1..<m.points.count where AnnotationView.segDist(p, m.points[i - 1], m.points[i]) <= half { return true }
+            return false
+        case .arrow:
+            guard let last = m.points.last else { return false }
+            return AnnotationView.segDist(p, first, last) <= max(m.width * 2.5, m.width / 2 + tol)
+                || hypot(p.x - last.x, p.y - last.y) <= max(m.width * 3, 14) + tol
+        case .rect:
+            guard let rr = rectOf(m) else { return false }
+            let outer = rr.insetBy(dx: -(m.width / 2 + tol), dy: -(m.width / 2 + tol))
+            let inset = m.width / 2 + tol
+            let inner = rr.insetBy(dx: inset, dy: inset)
+            return outer.contains(p) && !(inner.width > 0 && inner.height > 0 && inner.contains(p))
+        case .pixelate, .blur:
+            guard let rr = rectOf(m) else { return false }
+            return rr.insetBy(dx: -tol, dy: -tol).contains(p)
+        case .text:
+            let sz = NSAttributedString(string: m.text, attributes: textAttributes(m).fill).size()
+            return NSRect(origin: first, size: sz).insetBy(dx: -tol, dy: -tol).contains(p)
+        case .number:
+            return hypot(p.x - first.x, p.y - first.y) <= m.width / 2 + tol
+        case .eraser, .crop:
+            return false
+        }
+    }
+
+    func eraseAt(_ p: CGPoint) {
+        let tol = eraserRadius / scale
+        let kept = marks.filter { !hit($0, p, tol: tol) }
+        guard kept.count != marks.count else { return }
+        if !erasedThisDrag { pushHistory(); erasedThisDrag = true }   // bir sürükleme = tek Geri Al adımı
+        marks = kept
     }
 
     // MARK: Fare
@@ -1164,24 +1360,40 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         case .text:
             beginText(at: vp)
         case .number:
+            pushHistory()
             marks.append(Mark(tool: .number, color: color, width: (18 + lineWidth * 2) / scale, points: [p]))
+        case .eraser:
+            erasedThisDrag = false
+            eraseAt(p)
         default:
-            current = Mark(tool: tool, color: color, width: lineWidth / scale, points: [p])
+            current = Mark(tool: tool, color: color, width: lineWidth / scale, points: [p], arrow: arrowStyle)
         }
     }
     override func mouseDragged(with e: NSEvent) {
-        guard var c = current else { return }
         let p = toImage(convert(e.locationInWindow, from: nil))
+        if tool == .eraser { eraseAt(p); return }
+        guard var c = current else { return }
         if c.tool == .pen || c.tool == .marker { c.points.append(p) }
         else { c.points = [c.points[0], p] }
         current = c
     }
     override func mouseUp(with e: NSEvent) {
+        if tool == .eraser { erasedThisDrag = false; return }
         guard let c = current else { return }
         current = nil
+        if c.tool == .crop {
+            guard let rr = rectOf(c) else { return }
+            let newCrop = rr.intersection(crop).integral.intersection(fullRect)
+            guard newCrop.width * scale >= 8, newCrop.height * scale >= 8 else { return }
+            pushHistory()
+            crop = newCrop
+            onCropped?()
+            return
+        }
         if c.tool != .pen && c.tool != .marker {
             guard let rr = rectOf(c), hypot(rr.width, rr.height) > 3 / scale else { return }
         }
+        pushHistory()
         marks.append(c)
     }
 
@@ -1190,7 +1402,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
     func beginText(at vp: NSPoint) {
         editorFontPx = (10 + lineWidth * 2.5) / scale
         let f = NSTextField(string: "")
-        f.font = AnnotationView.font(size: editorFontPx * scale)
+        f.font = textFont.font(size: editorFontPx * scale)
         f.textColor = color
         f.backgroundColor = NSColor.black.withAlphaComponent(0.25)
         f.drawsBackground = true
@@ -1208,6 +1420,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
 
     func controlTextDidChange(_ n: Notification) {
         guard let f = editor else { return }
+        f.sizeToFit()
         let w = f.attributedStringValue.size().width + 24
         f.setFrameSize(NSSize(width: max(180, w), height: f.frame.height))
     }
@@ -1226,7 +1439,10 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         editor = nil
         f.removeFromSuperview()
         window?.makeFirstResponder(self)
-        if !s.isEmpty { marks.append(Mark(tool: .text, color: c, width: editorFontPx, points: [origin], text: s)) }
+        if !s.isEmpty {
+            pushHistory()
+            marks.append(Mark(tool: .text, color: c, width: editorFontPx, points: [origin], text: s, font: textFont))
+        }
     }
 
     func cancelText() {
@@ -1250,17 +1466,19 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
     }
     override func cancelOperation(_ sender: Any?) { window?.performClose(nil) }
 
-    /// İşaretlenmiş görseli tam çözünürlükte PNG olarak üretir
+    /// İşaretlenmiş (ve kırpılmış) görseli tam çözünürlükte PNG olarak üretir
     func renderPNG() -> Data? {
         commitText()
-        let w = Int(pixelSize.width), h = Int(pixelSize.height)
-        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+        let w = Int(crop.width.rounded()), h = Int(crop.height.rounded())
+        guard w > 0, h > 0,
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                                          colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
         else { return nil }
         rep.size = NSSize(width: w, height: h)
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        let t = NSAffineTransform(); t.translateX(by: -crop.minX, yBy: -crop.minY); t.concat()
         image.draw(in: fullRect)
         drawAll(includeCurrent: false)
         NSGraphicsContext.restoreGraphicsState()
@@ -1277,13 +1495,16 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
     var colorButtons: [NSButton] = []
     let status = NSTextField(labelWithString: "")
     let undoButton = NSButton(title: "Geri Al", target: nil, action: nil)
+    var toolControl: NSSegmentedControl!
+    var lastDrawTool: Tool = .pen
 
     static let palette: [NSColor] = [.systemRed, .systemOrange, .systemYellow, .systemGreen,
                                      .systemBlue, .systemPurple, .black, .white]
     static let tools: [(label: String, tip: String)] = [
-        ("✏️", "Kalem"), ("↗", "Ok"), ("▢", "Kutu"), ("🖍", "Fosforlu kalem"),
-        ("T", "Yazı: tıkla, yaz, Enter"), ("①", "Numaralı işaret: her tık 1, 2, 3…"),
-        ("▦", "Pikselleştir: alanı sürükleyerek seç"), ("◌", "Bulanıklaştır: alanı sürükleyerek seç")]
+        ("✏️", "Kalem"), ("↗", "Ok: tıklayınca sivri / yumuşak seç"), ("▢", "Kutu"), ("🖍", "Fosforlu kalem"),
+        ("T", "Yazı: tıklayınca font seç; resme tıkla, yaz, Enter"), ("①", "Numaralı işaret: her tık 1, 2, 3…"),
+        ("▦", "Pikselleştir: alanı sürükleyerek seç"), ("◌", "Bulanıklaştır: alanı sürükleyerek seç"),
+        ("⌫", "Silgi: üzerinden geçtiğin işaretleri siler"), ("✂︎", "Kırp: tutmak istediğin alanı seç")]
 
     init(image: NSImage, onClose: @escaping (AnnotationWindowController) -> Void, onSaved: @escaping () -> Void) {
         let cv = AnnotationView(image: image)
@@ -1294,21 +1515,28 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         let ptSize = NSSize(width: cv.pixelSize.width / 2, height: cv.pixelSize.height / 2)
         let maxW = screen.width * 0.85, maxH = screen.height * 0.85 - 56
         let s = min(1, maxW / max(ptSize.width + 32, 1), maxH / max(ptSize.height + 32, 1))
-        let size = NSSize(width: max(900, (ptSize.width + 32) * s), height: max(440, (ptSize.height + 32) * s + 56))
+        let size = NSSize(width: max(1000, (ptSize.width + 32) * s), height: max(440, (ptSize.height + 32) * s + 56))
 
         let win = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                            styleMask: [.titled, .closable, .resizable, .miniaturizable],
                            backing: .buffered, defer: false)
         win.title = "Googly İşaretle"
         win.isReleasedWhenClosed = false
-        win.minSize = NSSize(width: 860, height: 360)
+        win.minSize = NSSize(width: 960, height: 360)
         win.center()
         super.init(window: win)
         win.delegate = self
         buildUI()
-        canvas.onChange = { [weak self] in self?.undoButton.isEnabled = !(self?.canvas.marks.isEmpty ?? true) }
+        canvas.onChange = { [weak self] in self?.undoButton.isEnabled = !(self?.canvas.history.isEmpty ?? true) }
         canvas.onCommand = { [weak self] cmd in
             if cmd == "undo" { self?.undo() } else { self?.save() }
+        }
+        canvas.onCropped = { [weak self] in
+            // kırptıktan sonra son çizim aracına dön
+            guard let self = self else { return }
+            self.toolControl.selectedSegment = self.lastDrawTool.rawValue
+            self.canvas.tool = self.lastDrawTool
+            self.status.stringValue = "Kırpıldı ✓ (Geri Al ile eski haline dönebilirsin)"
         }
         canvas.onChange?()
     }
@@ -1321,6 +1549,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
                                        trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
         for (i, t) in Self.tools.enumerated() { tools.setToolTip(t.tip, forSegment: i) }
         tools.selectedSegment = 0
+        toolControl = tools
 
         let colors = NSStackView(); colors.spacing = 5
         for (i, c) in Self.palette.enumerated() {
@@ -1341,7 +1570,9 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         slider.toolTip = "Kalınlık / yazı boyu / numara boyu"
 
         undoButton.target = self; undoButton.action = #selector(undo); undoButton.bezelStyle = .rounded
+        undoButton.toolTip = "⌘Z"
         let clear = NSButton(title: "Temizle", target: self, action: #selector(clearAll))
+        clear.toolTip = "Tüm işaretleri ve kırpmayı kaldırır"
         let save = NSButton(title: "Panoya + Masaüstüne", target: self, action: #selector(save))
         save.bezelStyle = .rounded
         save.toolTip = "⌘S"
@@ -1377,14 +1608,60 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    @objc func toolChanged(_ s: NSSegmentedControl) { canvas.tool = Tool(rawValue: s.selectedSegment) ?? .pen }
+    @objc func toolChanged(_ s: NSSegmentedControl) {
+        let t = Tool(rawValue: s.selectedSegment) ?? .pen
+        canvas.tool = t
+        if t != .crop && t != .eraser { lastDrawTool = t }
+        switch t {
+        case .arrow: popUpMenu(arrowMenu(), under: s, segment: s.selectedSegment)
+        case .text: popUpMenu(fontMenu(), under: s, segment: s.selectedSegment)
+        case .crop: status.stringValue = "Tutmak istediğin alanı sürükleyerek seç"
+        case .eraser: status.stringValue = "Silmek istediğin işaretlerin üzerinden geç"
+        default: status.stringValue = ""
+        }
+    }
+
+    /// Seçilen aracın altında küçük bir seçenek menüsü aç
+    func popUpMenu(_ menu: NSMenu, under s: NSSegmentedControl, segment: Int) {
+        var x: CGFloat = 0
+        for i in 0..<segment { x += s.width(forSegment: i) > 0 ? s.width(forSegment: i) : s.bounds.width / CGFloat(s.segmentCount) }
+        let y = s.isFlipped ? s.bounds.height + 4 : -4
+        menu.popUp(positioning: nil, at: NSPoint(x: x, y: y), in: s)
+    }
+
+    func arrowMenu() -> NSMenu {
+        let m = NSMenu()
+        for (title, style) in [("↗  Sivri Ok", ArrowStyle.sharp), ("➚  Yumuşak Ok", ArrowStyle.soft)] {
+            let i = NSMenuItem(title: title, action: #selector(setArrowStyle(_:)), keyEquivalent: "")
+            i.target = self; i.tag = style.rawValue
+            i.state = canvas.arrowStyle == style ? .on : .off
+            m.addItem(i)
+        }
+        return m
+    }
+
+    func fontMenu() -> NSMenu {
+        let m = NSMenu()
+        for f in TextFont.allCases {
+            let i = NSMenuItem(title: f.title, action: #selector(setTextFont(_:)), keyEquivalent: "")
+            i.attributedTitle = NSAttributedString(string: f.title, attributes: [.font: f.font(size: 14)])
+            i.target = self; i.tag = f.rawValue
+            i.state = canvas.textFont == f ? .on : .off
+            m.addItem(i)
+        }
+        return m
+    }
+
+    @objc func setArrowStyle(_ i: NSMenuItem) { canvas.arrowStyle = ArrowStyle(rawValue: i.tag) ?? .sharp }
+    @objc func setTextFont(_ i: NSMenuItem) { canvas.textFont = TextFont(rawValue: i.tag) ?? .rounded }
+
     @objc func colorChanged(_ b: NSButton) {
         canvas.color = Self.palette[b.tag]; highlightColor(b.tag)
         canvas.editor?.textColor = canvas.color
     }
     @objc func widthChanged(_ s: NSSlider) { canvas.lineWidth = CGFloat(s.doubleValue) }
-    @objc func undo() { canvas.commitText(); if !canvas.marks.isEmpty { canvas.marks.removeLast() } }
-    @objc func clearAll() { canvas.cancelText(); canvas.marks.removeAll() }
+    @objc func undo() { canvas.undoLast() }
+    @objc func clearAll() { canvas.clearAll() }
 
     @objc func save() {
         guard let png = canvas.renderPNG() else { return }
