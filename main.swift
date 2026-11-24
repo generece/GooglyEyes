@@ -98,6 +98,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var selectionWindows: [NSWindow] = []
     var frozen: [CGDirectDisplayID: CGImage] = [:]
     let webpWatcher = WebpWatcher()
+    var updateTimer: Timer?
+    var updateAvailable = false
+    var updating = false
 
     // çöp kutusu korkusu
     var fear: CGFloat = 0
@@ -164,6 +167,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         registerHotKey()
         webpWatcher.onConverted = { [weak self] in self?.surprise(0.6) }
+        // açılıştan biraz sonra ve günde bir güncelleme var mı bak (sadece haber verir)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.checkForUpdates(manual: false) }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+            self?.checkForUpdates(manual: false)
+        }
         if Pref.webpToPng { webpWatcher.start() }
         tick()
     }
@@ -237,6 +245,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(.separator())
 
         m.addItem(item("Çöp Kutusu Korkusu için Erişilebilirlik İzni…", #selector(openAccessibility)))
+        let upd = item("Güncellemeleri Kontrol Et", #selector(checkForUpdatesManually)); upd.tag = 46
+        m.addItem(upd)
         let login = item("Girişte Başlat", #selector(toggleLogin(_:))); login.tag = 42
         m.addItem(login)
         m.addItem(item("Ekran Kaydı İzinlerini Aç…", #selector(openPrivacy)))
@@ -269,6 +279,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleAutoAnnotate() { Pref.autoAnnotate.toggle() }
+    // MARK: Güncelleme
+
+    func setUpdateMenu(_ title: String, enabled: Bool = true) {
+        guard let i = statusItem.menu?.item(withTag: 46) else { return }
+        i.title = title
+        i.isEnabled = enabled
+    }
+
+    @objc func checkForUpdatesManually() {
+        if updateAvailable { confirmUpdate(); return }
+        checkForUpdates(manual: true)
+    }
+
+    func checkForUpdates(manual: Bool) {
+        if updating { return }
+        if manual { setUpdateMenu("Kontrol ediliyor…", enabled: false) }
+        Updater.latestCommit { [weak self] latest in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard let latest = latest else {
+                    self.setUpdateMenu("Güncellemeleri Kontrol Et")
+                    if manual { self.alert("Kontrol edilemedi", "GitHub'a ulaşılamadı. İnternet bağlantını kontrol edip tekrar dene.") }
+                    return
+                }
+                if latest != Updater.installedCommit {
+                    self.updateAvailable = true
+                    self.setUpdateMenu("✨ Güncelleme Var: Yükle")
+                    self.surprise(0.8)
+                    if manual { self.confirmUpdate() }
+                } else {
+                    self.updateAvailable = false
+                    self.setUpdateMenu("Güncellemeleri Kontrol Et")
+                    if manual { self.alert("Güncelsin ✓", "GooglyEyes'ın en son sürümünü kullanıyorsun.") }
+                }
+            }
+        }
+    }
+
+    func confirmUpdate() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Yeni sürüm hazır"
+        a.informativeText = "GooglyEyes son sürümü indirip bu Mac'te kuracak ve kendini yeniden başlatacak. Bu 10–30 saniye sürebilir."
+        a.addButton(withTitle: "Güncelle")
+        a.addButton(withTitle: "Sonra")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        updating = true
+        setUpdateMenu("Güncelleniyor…", enabled: false)
+        Updater.install { [weak self] ok, log in
+            DispatchQueue.main.async {
+                // başarılıysa kurulum scripti bu uygulamayı kapatıp yenisini açar; buraya sadece hata durumunda gelinir
+                guard let self = self, !ok else { return }
+                self.updating = false
+                self.setUpdateMenu("✨ Güncelleme Var: Yükle")
+                let needsTools = log.contains("Swift derleyicisi yok")
+                self.alert("Güncelleme tamamlanamadı",
+                           needsTools
+                           ? "Bu Mac'te Xcode Komut Satırı Araçları yok. Açılan Apple penceresinde 'Yükle'ye bas; kurulum bitince menüden tekrar 'Güncelleme Var: Yükle'yi seç."
+                           : "Ayrıntı:\n" + String(log.suffix(600)))
+            }
+        }
+    }
+
     @objc func setSaveTarget(_ sender: NSMenuItem) { Pref.saveToDesktop = sender.tag == 301 }
     @objc func toggleWebp() {
         Pref.webpToPng.toggle()
@@ -846,6 +919,50 @@ enum TrashWatch {
                 && (w[kCGWindowLayer as String] as? Int) == 0
                 && trashNames.contains(w[kCGWindowName as String] as? String ?? "")
         }
+    }
+}
+
+// MARK: - Güncelleyici
+
+enum Updater {
+    static let repo = "generece/GooglyEyes"
+
+    /// Bu kopyanın derlendiği commit (build.sh Info.plist'e yazar)
+    static var installedCommit: String {
+        Bundle.main.object(forInfoDictionaryKey: "GooglyCommit") as? String ?? "unknown"
+    }
+
+    /// GitHub'daki main dalının son commit'i
+    static func latestCommit(_ completion: @escaping (String?) -> Void) {
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/commits/main")!)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let sha = obj["sha"] as? String else { completion(nil); return }
+            completion(sha)
+        }.resume()
+    }
+
+    /// install.sh'ı GitHub'dan çalıştırır: indir, derle, kur, yeniden başlat.
+    /// Çıktı dosyaya yazılır: kurulum bu uygulamayı kapattığında script yarıda kalmasın diye.
+    static func install(_ completion: @escaping (Bool, String) -> Void) {
+        let logURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs/GooglyEyes-update.log")
+        try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-c", "set -o pipefail; curl -fsSL https://raw.githubusercontent.com/\(repo)/main/install.sh | bash > \"$1\" 2>&1",
+                       "googly-update", logURL.path]
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        p.terminationHandler = { proc in
+            let text = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+            completion(proc.terminationStatus == 0, text)
+        }
+        do { try p.run() } catch { completion(false, error.localizedDescription) }
     }
 }
 

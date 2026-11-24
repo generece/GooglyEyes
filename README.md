@@ -32,17 +32,25 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 
 ## Kurulum
 
-Gereken tek şey Xcode Command Line Tools (yoksa script kurulumu kendisi başlatır).
+Terminal'i aç ve şu satırı yapıştır:
 
 ```bash
-bash build.sh
+curl -fsSL https://raw.githubusercontent.com/generece/GooglyEyes/main/install.sh | bash
 ```
 
-Script uygulamayı derler, sabit bir yerel sertifikayla imzalar (böylece Ekran Kaydı izni her derlemede sıfırlanmaz), `~/Applications/GooglyEyes.app` olarak kurar ve başlatır.
+Script son sürümü indirir, bu Mac'te derler, `~/Applications/GooglyEyes.app` olarak kurar ve başlatır.
 
-İlk ⌥⇧S'te **Ekran Kaydı** izni istenir: Sistem Ayarları → Gizlilik ve Güvenlik → Ekran ve Sistem Ses Kaydı'nda GooglyEyes'ı aç, sonra uygulamayı yeniden başlat.
+- Bu Mac'te Xcode Command Line Tools yoksa Apple'ın kurulum penceresi açılır; "Yükle"ye bas, bitince komutu tekrar çalıştır.
+- İlk kurulumda uygulamayı imzalamak için yerel bir sertifika oluşturulur; Mac şifren istenirse gir ve "Her Zaman İzin Ver"e bas. Bu sayede güncellemelerde izinler sıfırlanmaz.
+- İlk ⌥⇧S'te **Ekran Kaydı** izni istenir: Sistem Ayarları → Gizlilik ve Güvenlik → Ekran ve Sistem Ses Kaydı'nda GooglyEyes'ı aç, sonra uygulamayı yeniden başlat.
 
 > ⌥⇧S başka bir uygulamada ya da Kestirmeler (Shortcuts) uygulamasında tanımlıysa çakışır; önce onu kaldır.
+
+## Güncelleme
+
+Gözlere tıkla → **Güncellemeleri Kontrol Et**. Yeni sürüm varsa tek tıkla indirilir, kurulur ve uygulama yeniden açılır. Uygulama açılışta ve günde bir kez kendisi de bakar; yeni sürüm varsa menüde **✨ Güncelleme Var** yazar.
+
+Kaynak koddan elle derlemek için: `bash build.sh`
 
 ## Gereksinimler
 
