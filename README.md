@@ -15,7 +15,8 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 
 **Ekran görüntüsü — ⌥⇧S**
 - Bölge seçimi; birden fazla ekranda çalışır
-- Görüntü panoya kopyalanır ve masaüstüne kaydedilir
+- Kısayola basıldığı an ekran dondurulur; açık menüler/açılır pencereler kapansa bile görüntü o anın hali olur
+- Menüden seçilir: sadece panoya ya da panoya + masaüstüne
 - Yakalama ScreenCaptureKit ile yapılır (macOS 14+)
 
 **WebP → PNG**
