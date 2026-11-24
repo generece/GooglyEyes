@@ -98,7 +98,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var selectionWindows: [NSWindow] = []
     var frozen: [CGDirectDisplayID: CGImage] = [:]
     let webpWatcher = WebpWatcher()
-    var updateTimer: Timer?
     var updateAvailable = false
     var updating = false
 
@@ -167,11 +166,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         registerHotKey()
         webpWatcher.onConverted = { [weak self] in self?.surprise(0.6) }
-        // açılıştan biraz sonra ve günde bir güncelleme var mı bak (sadece haber verir)
+        // açılıştan biraz sonra bir kez güncelleme var mı bak; sadece menüde haber verir, kendiliğinden kurmaz
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.checkForUpdates(manual: false) }
-        updateTimer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
-            self?.checkForUpdates(manual: false)
-        }
         if Pref.webpToPng { webpWatcher.start() }
         tick()
     }

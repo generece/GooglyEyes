@@ -48,7 +48,7 @@ Script son sürümü indirir, bu Mac'te derler, `~/Applications/GooglyEyes.app` 
 
 ## Güncelleme
 
-Gözlere tıkla → **Güncellemeleri Kontrol Et**. Yeni sürüm varsa tek tıkla indirilir, kurulur ve uygulama yeniden açılır. Uygulama açılışta ve günde bir kez kendisi de bakar; yeni sürüm varsa menüde **✨ Güncelleme Var** yazar.
+Gözlere tıkla → **Güncellemeleri Kontrol Et**. Yeni sürüm varsa tek tıkla indirilir, kurulur ve uygulama yeniden açılır. Uygulama açılışta da bir kez bakar; yeni sürüm varsa menüde **✨ Güncelleme Var** yazar. Güncelleme asla kendiliğinden yapılmaz, sen onaylamadan hiçbir şey indirilmez.
 
 Kaynak koddan elle derlemek için: `bash build.sh`
 
