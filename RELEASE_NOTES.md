@@ -1,2 +1,3 @@
-• Daha az pil tüketimi: gözler hareketsizken uygulama çok daha seyrek çalışır
-• Güncelleme penceresinde yenilikler artık görünür
+• Yeni kaşlar: kemerli, kızgın, endişeli, neşeli (Ayarlar → Gözler)
+• Ayarlar → Genel'e "İzinleri Sıfırla" eklendi: izin verilmiş görünüp çalışmıyorsa tek tıkla düzeltir
+• Daha az pil tüketimi

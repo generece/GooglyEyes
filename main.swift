@@ -29,6 +29,8 @@ enum Tex {
     static let pupils: [String: NSImage] = Dictionary(uniqueKeysWithValues:
         ["pupil_blue", "pupil_green", "pupil_purple", "pupil_orange",
          "pupil_heart", "pupil_star", "pupil_diamond", "pupil_sparkle"].map { ($0, load($0)) })
+    static let brows: [String: NSImage] = Dictionary(uniqueKeysWithValues:
+        ["arch", "angry", "worried", "happy"].flatMap { ["brow_\($0)_l", "brow_\($0)_r"] }.map { ($0, load($0)) })
     static let glasses: [String: NSImage] = Dictionary(uniqueKeysWithValues:
         ["glasses_black", "glasses_cat", "glasses_square", "glasses_gold"].map { ($0, load($0)) })
 }
@@ -65,7 +67,7 @@ enum Pref {
         get { d.integer(forKey: "glassesStyle") }
         set { d.set(newValue, forKey: "glassesStyle") }
     }
-    /// 0 yok, 1 kızgın, 2 üzgün
+    /// Costume.browOptions sırasıyla
     static var brows: Int {
         get { d.integer(forKey: "brows") }
         set { d.set(newValue, forKey: "brows") }
@@ -805,19 +807,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSGraphicsContext.restoreGraphicsState()
             }
         }
-        if Pref.brows != 0 && !sleeping {
-            let angry = Pref.brows == 1
-            let b = NSBezierPath()
-            b.lineWidth = max(1.6, es * 0.12)
-            b.lineCapStyle = .round
+        let browStyle = Costume.browOptions[min(max(Pref.brows, 0), Costume.browOptions.count - 1)].tex
+        if let style = browStyle {
+            // kaş, göz akının üst kenarına biraz binecek şekilde
+            let ees = es * (Costume.hasGlasses ? 0.8 : 1)
             for (i, c) in centers.enumerated() {
-                let outer: CGFloat = i == 0 ? -1 : 1                  // burundan uzak taraf
-                let hiOuter = angry ? 0.47 : 0.30, hiInner = angry ? 0.26 : 0.47
-                b.move(to: NSPoint(x: c.x + outer * es * 0.42, y: c.y + es * hiOuter))
-                b.line(to: NSPoint(x: c.x - outer * es * 0.30, y: c.y + es * hiInner))
+                guard let tex = Tex.brows["brow_\(style)_\(i == 0 ? "l" : "r")"], tex.size.width > 0 else { continue }
+                let bw = ees * 0.95, bh = bw * tex.size.height / tex.size.width
+                let top = c.y + ees * 0.5 + bh * 0.15
+                tex.draw(in: NSRect(x: c.x - bw / 2, y: top - bh, width: bw, height: bh))
             }
-            NSColor(white: 0.05, alpha: 1).setStroke()
-            b.stroke()
         }
     }
 
@@ -1377,6 +1376,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     let screenButton = NSButton(title: "İzin Ver…", target: nil, action: nil)
     let axStatus = NSTextField(labelWithString: "")
     let axButton = NSButton(title: "İzin Ver…", target: nil, action: nil)
+    let resetPermsButton = NSButton(title: "İzinleri Sıfırla…", target: nil, action: nil)
     let versionLabel = NSTextField(labelWithString: "")
     let updateButton = NSButton(title: "Güncellemeleri Kontrol Et", target: nil, action: nil)
 
@@ -1476,6 +1476,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         loginCheck.target = self; loginCheck.action = #selector(loginChanged)
         screenButton.target = self; screenButton.action = #selector(askScreen)
         axButton.target = self; axButton.action = #selector(askAX)
+        resetPermsButton.target = self; resetPermsButton.action = #selector(resetPermissions)
+        resetPermsButton.controlSize = .small
         for b in [screenButton, axButton] { b.controlSize = .small }
         updateButton.target = self; updateButton.action = #selector(checkUpdates)
 
@@ -1503,7 +1505,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [e, loginCheck],
             [label("Ekran Kaydı:"), row([screenStatus, screenButton])],
             [label("Erişilebilirlik:"), row([axStatus, axButton])],
-            [e, note("İzin verdikten sonra GooglyEyes'ı kapatıp yeniden aç.")],
+            [e, note("İzin verdikten sonra GooglyEyes'ı kapatıp yeniden aç. Sistem Ayarları'nda açık görünüp burada \"Verilmedi\" yazıyorsa İzinleri Sıfırla'ya bas.")],
+            [e, resetPermsButton],
             [section("Güncelleme"), e],
             [label("Sürüm:"), row([versionLabel, updateButton])],
         ]
@@ -1625,6 +1628,27 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc func loginChanged() { app?.setLogin(loginCheck.state == .on); refresh() }
     @objc func askScreen() { _ = CGRequestScreenCaptureAccess(); app?.openPrivacy() }
     @objc func askAX() { app?.openAccessibility() }
+
+    /// Ayarlarda "verilmiş" görünüp çalışmayan (eski imzaya ait) izin kayıtlarını temizler
+    @objc func resetPermissions() {
+        let a = NSAlert()
+        a.messageText = "İzinler sıfırlansın mı?"
+        a.informativeText = "Sistem Ayarları'nda açık görünüp GooglyEyes'ta \"Verilmedi\" yazıyorsa izin kaydı eskimiştir. Sıfırladıktan sonra açılan pencerelerden izinleri yeniden ver ve GooglyEyes'ı yeniden başlat."
+        a.addButton(withTitle: "Sıfırla")
+        a.addButton(withTitle: "Vazgeç")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let id = Bundle.main.bundleIdentifier ?? "com.ecegener.googlyeyes"
+        for service in ["Accessibility", "ScreenCapture"] {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            p.arguments = ["reset", service, id]
+            try? p.run()
+            p.waitUntilExit()
+        }
+        _ = CGRequestScreenCaptureAccess()
+        app?.openAccessibility()
+        refresh()
+    }
     @objc func checkUpdates() { app?.checkForUpdatesManually() }
 
     func windowWillClose(_ n: Notification) {
@@ -2143,7 +2167,11 @@ enum Costume {
     static var glassesNames: [String] { glassesOptions.map { $0.name } }
     static var hasGlasses: Bool { glassesOptions[min(max(Pref.glasses, 0), glassesOptions.count - 1)].tex != nil }
 
-    static let browNames = ["Yok", "Kızgın", "Üzgün"]
+    /// Kaşlar (EyeBrows.png'den): (ad, doku öneki)
+    static let browOptions: [(name: String, tex: String?)] = [
+        ("Yok", nil), ("Kemerli", "arch"), ("Kızgın", "angry"), ("Endişeli", "worried"), ("Neşeli", "happy"),
+    ]
+    static var browNames: [String] { browOptions.map { $0.name } }
 
     static func pupilTexture() -> NSImage? {
         guard let name = pupilOptions[min(max(Pref.eyeColor, 0), pupilOptions.count - 1)].tex else { return nil }
