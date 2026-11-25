@@ -240,12 +240,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(sleepItem)
         m.addItem(.separator())
 
-        m.addItem(item("Çöp Kutusu Korkusu için Erişilebilirlik İzni…", #selector(openAccessibility)))
         let upd = item("Güncellemeleri Kontrol Et", #selector(checkForUpdatesManually)); upd.tag = 46
         m.addItem(upd)
         let login = item("Girişte Başlat", #selector(toggleLogin(_:))); login.tag = 42
         m.addItem(login)
-        m.addItem(item("Ekran Kaydı İzinlerini Aç…", #selector(openPrivacy)))
+        // İzinler: hepsi tek alt menüde; ✓ verilmiş olanları gösterir
+        let permItem = NSMenuItem(title: "İzinler", action: nil, keyEquivalent: "")
+        let permMenu = NSMenu()
+        let screenPerm = item("Ekran Kaydı (ekran görüntüsü için)…", #selector(openPrivacy)); screenPerm.tag = 400
+        let axPerm = item("Erişilebilirlik (çöp kutusu korkusu için)…", #selector(openAccessibility)); axPerm.tag = 401
+        permMenu.addItem(screenPerm)
+        permMenu.addItem(axPerm)
+        permMenu.addItem(.separator())
+        let note = NSMenuItem(title: "✓ olanlar verilmiş · değişiklikten sonra uygulamayı yeniden başlat", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        permMenu.addItem(note)
+        permItem.submenu = permMenu
+        m.addItem(permItem)
         m.addItem(.separator())
         m.addItem(item("GooglyEyes Hakkında", #selector(showAbout)))
         m.addItem(NSMenuItem(title: "Çıkış", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -267,6 +278,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.item(withTag: 43)?.state = Pref.autoAnnotate ? .on : .off
         menu.item(withTag: 44)?.state = Pref.randomBehaviors ? .on : .off
         menu.item(withTag: 45)?.state = Pref.webpToPng ? .on : .off
+        if let i = menu.item(withTag: 400) {
+            i.state = CGPreflightScreenCaptureAccess() ? .on : .off
+        }
+        menu.item(withTag: 401)?.state = AXIsProcessTrusted() ? .on : .off
         menu.item(withTag: 300)?.state = Pref.saveToDesktop ? .off : .on
         menu.item(withTag: 301)?.state = Pref.saveToDesktop ? .on : .off
         for i in menu.items { if let sub = i.submenu { menuWillOpen(sub) } }
