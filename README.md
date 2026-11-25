@@ -32,19 +32,19 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 
 ## Kurulum
 
-Terminal'i aç ve şu satırı yapıştır:
+Xcode gerekmez. Terminal'i aç ve şu satırı yapıştır:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/generece/GooglyEyes/main/install.sh | bash
 ```
 
-Script son sürümü indirir, bu Mac'te derler, `~/Applications/GooglyEyes.app` olarak kurar ve başlatır.
+Script en son hazır sürümü indirir, `~/Applications/GooglyEyes.app` olarak kurar ve başlatır. Bu yolla kurunca macOS'un "açılamıyor" uyarısı çıkmaz.
 
-- Bu Mac'te Xcode Command Line Tools yoksa Apple'ın kurulum penceresi açılır; "Yükle"ye bas, bitince komutu tekrar çalıştır.
-- İlk kurulumda uygulamayı imzalamak için yerel bir sertifika oluşturulur; Mac şifren istenirse gir ve "Her Zaman İzin Ver"e bas. Bu sayede güncellemelerde izinler sıfırlanmaz.
-- İlk ⌥⇧S'te **Ekran Kaydı** izni istenir: Sistem Ayarları → Gizlilik ve Güvenlik → Ekran ve Sistem Ses Kaydı'nda GooglyEyes'ı aç, sonra uygulamayı yeniden başlat.
+**Tarayıcıdan indirmek istersen:** [Releases](https://github.com/generece/GooglyEyes/releases/latest) sayfasından `GooglyEyes.zip`'i indir, aç, uygulamayı Uygulamalar klasörüne taşı. İlk açılışta macOS uyarı verirse uygulamaya **sağ tıkla → Aç** de (ya da Sistem Ayarları → Gizlilik ve Güvenlik → **Yine de Aç**). Bu sadece bir kez gerekir.
 
-> ⌥⇧S başka bir uygulamada ya da Kestirmeler (Shortcuts) uygulamasında tanımlıysa çakışır; önce onu kaldır.
+İlk ekran görüntüsünde **Ekran Kaydı** izni istenir: Sistem Ayarları → Gizlilik ve Güvenlik → Ekran ve Sistem Ses Kaydı'nda GooglyEyes'ı aç, sonra uygulamayı yeniden başlat.
+
+> Kısayollar başka bir uygulamada ya da Kestirmeler (Shortcuts) uygulamasında tanımlıysa çakışır; Ayarlar'dan değiştirebilirsin.
 
 ## Ayarlar
 
@@ -54,7 +54,7 @@ Gözlere tıkla → **Ayarlar…**: ekran görüntüsü kısayolu, kaydetme yeri
 
 Ayarlar → **Güncellemeleri Kontrol Et**. Yeni sürüm varsa tek tıkla indirilir, kurulur ve uygulama yeniden açılır. Uygulama açılışta da bir kez bakar; yeni sürüm varsa menüde **✨ Güncelleme Var** yazar. Güncelleme asla kendiliğinden yapılmaz, sen onaylamadan hiçbir şey indirilmez.
 
-Kaynak koddan elle derlemek için: `bash build.sh`
+Her `main` push'unda GitHub Actions uygulamayı Apple Silicon + Intel için derleyip yayınlar. Kaynak koddan kendin derlemek istersen (Xcode Command Line Tools gerekir): `bash build.sh`
 
 ## Gereksinimler
 

@@ -1,27 +1,28 @@
 #!/bin/bash
-# GooglyEyes kurulum / güncelleme
+# GooglyEyes kurulum / güncelleme (Xcode gerekmez)
 # Kullanım:  curl -fsSL https://raw.githubusercontent.com/generece/GooglyEyes/main/install.sh | bash
-# GitHub'daki son sürümü indirir, bu Mac'te derler, ~/Applications'a kurar ve başlatır.
+# GitHub'daki en son hazır sürümü indirir, ~/Applications'a kurar ve başlatır.
 set -e
 
 REPO="generece/GooglyEyes"
-DIR="$HOME/Library/Application Support/GooglyEyes"
-mkdir -p "$DIR"
+URL="https://github.com/$REPO/releases/latest/download/GooglyEyes.zip"
 
-echo "→ Son sürüm bilgisi alınıyor…"
-SHA=$(curl -fsSL "https://api.github.com/repos/$REPO/commits/main" 2>/dev/null \
-      | grep -m1 '"sha"' | sed -E 's/.*"sha": *"([0-9a-f]+)".*/\1/') || true
-[ -n "$SHA" ] || SHA="unknown"
-
-echo "→ İndiriliyor…"
+echo "→ Son sürüm indiriliyor…"
 TMP="$(mktemp -d)"
-curl -fsSL "https://github.com/$REPO/archive/refs/heads/main.zip" -o "$TMP/src.zip"
-ditto -x -k "$TMP/src.zip" "$TMP"
-SRC="$(find "$TMP" -maxdepth 1 -type d -name 'GooglyEyes-*' | head -1)"
-[ -n "$SRC" ] || { echo "İndirilen arşiv açılamadı."; exit 1; }
+curl -fsSL "$URL" -o "$TMP/GooglyEyes.zip"
+ditto -x -k "$TMP/GooglyEyes.zip" "$TMP"
+[ -d "$TMP/GooglyEyes.app" ] || { echo "İndirilen dosya açılamadı."; exit 1; }
+xattr -dr com.apple.quarantine "$TMP/GooglyEyes.app" 2>/dev/null || true
 
-rm -rf "$DIR/src"
-mv "$SRC" "$DIR/src"
+DEST="$HOME/Applications/GooglyEyes.app"
+mkdir -p "$HOME/Applications"
+# -a: güncelleme uygulamanın içinden başlatıldığında da onu kapat
+pkill -a -x GooglyEyes 2>/dev/null || true
+sleep 0.5
+rm -rf "$DEST"
+mv "$TMP/GooglyEyes.app" "$DEST"
 rm -rf "$TMP"
 
-GOOGLY_COMMIT="$SHA" bash "$DIR/src/build.sh"
+echo "→ Kuruldu: $DEST"
+open "$DEST"
+echo "✓ Gözler menü çubuğunda!"
