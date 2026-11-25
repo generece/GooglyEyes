@@ -2220,7 +2220,7 @@ enum Costume {
         ("Yok", nil, 0, 0),
         ("Siyah yuvarlak", "glasses_black", 0.232, 0.767),
         ("Kedi gözü", "glasses_cat", 0.247, 0.746),
-        ("Kare", "glasses_square", 0.231, 0.767),
+        ("Kare", "glasses_square", 0.229, 0.768),
         ("Altın", "glasses_gold", 0.227, 0.775),
     ]
     static var glassesNames: [String] { glassesOptions.map { $0.name } }
