@@ -247,6 +247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(login)
         m.addItem(item("Ekran Kaydı İzinlerini Aç…", #selector(openPrivacy)))
         m.addItem(.separator())
+        m.addItem(item("GooglyEyes Hakkında", #selector(showAbout)))
         m.addItem(NSMenuItem(title: "Çıkış", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         return m
     }
@@ -275,6 +276,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleAutoAnnotate() { Pref.autoAnnotate.toggle() }
+    // MARK: Hakkında
+
+    @objc func showAbout() {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        let commit = Updater.installedCommit
+        let build = commit == "unknown" ? "yerel derleme" : String(commit.prefix(7))
+
+        let center = NSMutableParagraphStyle(); center.alignment = .center
+        let small: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11),
+                                                     .foregroundColor: NSColor.secondaryLabelColor,
+                                                     .paragraphStyle: center]
+        let credits = NSMutableAttributedString()
+        credits.append(NSAttributedString(string: "Ece Gener tarafından yapıldı 👀\n\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.labelColor, .paragraphStyle: center]))
+        credits.append(NSAttributedString(string: "Menü çubuğunda mouse'u takip eden gözler,\nbölge ekran görüntüsü ve işaretleme.\n\n", attributes: small))
+        var link = small
+        link[.link] = URL(string: "https://github.com/\(Updater.repo)")!
+        credits.append(NSAttributedString(string: "github.com/\(Updater.repo)", attributes: link))
+
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "GooglyEyes",
+            .applicationVersion: version,
+            .version: build,
+            .credits: credits,
+        ])
+    }
+
     // MARK: Güncelleme
 
     func setUpdateMenu(_ title: String, enabled: Bool = true) {
