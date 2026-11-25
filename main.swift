@@ -698,7 +698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { [self] _ in
             for (i, eye) in [leftEye, rightEye].enumerated() {
                 let cx = pad + eyeSize / 2 + CGFloat(i) * (eyeSize + gap)
-                drawEye(eye, index: i, center: CGPoint(x: cx, y: h / 2), surprise: s, now: now)
+                drawEye(eye, index: i, center: CGPoint(x: cx, y: eyeCenterY(h)), surprise: s, now: now)
             }
             drawAccessories(height: h)
             if sleeping { drawZzz(x0: eyesWidth - pad + 1, height: h, now: now) }
@@ -717,7 +717,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func drawEye(_ eye: Eye, index: Int, center c: CGPoint, surprise s: CGFloat, now: CFTimeInterval) {
-        let k: CGFloat = Costume.hasGlasses ? 0.8 : 1        // gözlük takılıyken gözler camlara sığsın
+        let k = eyeScale
         let es = eyeSize * k
         if sleeping || (eye.isClosed && s < 0.01) || (eye.held && !capturing) {
             // kapalıyken: göz akı açık kalır, üstünde siyah tire, en üstte kubbe parlaması
@@ -790,32 +790,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Tex.shine.draw(in: sRect, from: .zero, operation: .sourceOver, fraction: 0.9)
     }
 
+    var hasBrows: Bool { Costume.browOptions[min(max(Pref.brows, 0), Costume.browOptions.count - 1)].tex != nil }
+    /// Kaş varken gözler küçülüp aşağı iner ki kaşlar göz akının üstüne sığsın; gözlükte camlara sığsın
+    var eyeScale: CGFloat { hasBrows ? 0.7 : (Costume.hasGlasses ? 0.8 : 1) }
+    func eyeCenterY(_ h: CGFloat) -> CGFloat {
+        hasBrows ? h / 2 - eyeSize * (1 - eyeScale) / 2 : h / 2
+    }
+
     /// Gözlük ve kaşlar (Ayarlar → Gözler)
     func drawAccessories(height h: CGFloat) {
         let es = eyeSize
-        let centers = (0..<2).map { CGPoint(x: pad + es / 2 + CGFloat($0) * (es + gap), y: h / 2) }
+        let centers = (0..<2).map { CGPoint(x: pad + es / 2 + CGFloat($0) * (es + gap), y: eyeCenterY(h)) }
         let g = Costume.glassesOptions[min(max(Pref.glasses, 0), Costume.glassesOptions.count - 1)]
         if let name = g.tex, let tex = Tex.glasses[name], tex.size.height > 0 {
             // gözlüğü çubuk yüksekliğine sığdır; sol yarıyı sol göze, sağ yarıyı sağ göze ortala
-            let gh = h * 0.98, gw = gh * tex.size.width / tex.size.height
+            // kaş yokken çubuk yüksekliğinde; kaş varken küçülen gözlere göre
+            let gh = hasBrows ? es * eyeScale * 1.33 : h * 0.98, gw = gh * tex.size.width / tex.size.height
             let mid = (centers[0].x + centers[1].x) / 2
             for (i, lens) in [g.left, g.right].enumerated() {
                 NSGraphicsContext.saveGraphicsState()
                 NSBezierPath(rect: i == 0 ? NSRect(x: 0, y: 0, width: mid, height: h)
                                           : NSRect(x: mid, y: 0, width: 1000, height: h)).addClip()
-                tex.draw(in: NSRect(x: centers[i].x - lens * gw, y: (h - gh) / 2, width: gw, height: gh))
+                tex.draw(in: NSRect(x: centers[i].x - lens * gw, y: centers[i].y - gh / 2, width: gw, height: gh))
                 NSGraphicsContext.restoreGraphicsState()
             }
         }
         let browStyle = Costume.browOptions[min(max(Pref.brows, 0), Costume.browOptions.count - 1)].tex
         if let style = browStyle {
-            // kaş, göz akının üst kenarına biraz binecek şekilde
-            let ees = es * (Costume.hasGlasses ? 0.8 : 1)
+            let ees = es * eyeScale
             for (i, c) in centers.enumerated() {
                 guard let tex = Tex.brows["brow_\(style)_\(i == 0 ? "l" : "r")"], tex.size.width > 0 else { continue }
-                let bw = ees * 0.95, bh = bw * tex.size.height / tex.size.width
-                let top = c.y + ees * 0.5 + bh * 0.15
-                tex.draw(in: NSRect(x: c.x - bw / 2, y: top - bh, width: bw, height: bh))
+                let bw = ees * 1.0, bh = bw * tex.size.height / tex.size.width
+                // göz akının hemen üstünde, üst üste binmeden
+                let bottom = min(c.y + ees * 0.5 + 0.5, h - bh)
+                tex.draw(in: NSRect(x: c.x - bw / 2, y: bottom, width: bw, height: bh))
             }
         }
     }
