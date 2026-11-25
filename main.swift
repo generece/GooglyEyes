@@ -99,6 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var frozen: [CGDirectDisplayID: CGImage] = [:]
     let webpWatcher = WebpWatcher()
     var updateAvailable = false
+    var settings: SettingsWindowController?
     var updating = false
 
     // çöp kutusu korkusu
@@ -201,24 +202,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let shot = NSMenuItem(title: "Bölge Ekran Görüntüsü Al", action: #selector(captureRegion), keyEquivalent: "")
         shot.target = self; shot.tag = 47
         m.addItem(shot)
-        m.addItem(item("Kısayolu Değiştir…", #selector(changeHotKey)))
         m.addItem(item("Panodaki Görseli Aç ve İşaretle…", #selector(openAnnotatorFromClipboard)))
-        let auto = item("Ekran Görüntüsünden Sonra İşaretlemeyi Aç", #selector(toggleAutoAnnotate)); auto.tag = 43
-        m.addItem(auto)
-        let saveItem = NSMenuItem(title: "Ekran Görüntüsünü Kaydet", action: nil, keyEquivalent: "")
-        let saveMenu = NSMenu()
-        let onlyClip = item("Sadece Panoya", #selector(setSaveTarget(_:))); onlyClip.tag = 300
-        let both = item("Panoya + Masaüstüne", #selector(setSaveTarget(_:))); both.tag = 301
-        saveMenu.addItem(onlyClip); saveMenu.addItem(both)
-        saveItem.submenu = saveMenu
-        m.addItem(saveItem)
-        let webp = item("İndirilen WebP'leri PNG'ye Çevir", #selector(toggleWebp)); webp.tag = 45
-        webp.toolTip = "İndirilenler ve Masaüstü'ne gelen yeni .webp dosyalarını .png yapar; WebP'nin aslı Çöp Sepeti'ne gider"
-        m.addItem(webp)
         m.addItem(.separator())
 
-        let rnd = item("Rastgele Davranışlar", #selector(toggleRandom)); rnd.tag = 44
-        m.addItem(rnd)
         let tryItem = NSMenuItem(title: "Hareketleri Dene", action: nil, keyEquivalent: "")
         let tryMenu = NSMenu()
         for (title, tag) in [("Şaşır 😮", 3), ("Göz Devir 🙄", 4), ("Spiral Göz 🌀", 6),
@@ -228,36 +214,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         tryItem.submenu = tryMenu
         m.addItem(tryItem)
-        let sleepItem = NSMenuItem(title: "Uyku", action: nil, keyEquivalent: "")
-        let sleepMenu = NSMenu()
-        for (title, secs) in [("30 saniye sonra", 30.0), ("1 dakika sonra", 60.0), ("5 dakika sonra", 300.0), ("Kapalı", 0.0)] {
-            let i = item(title, #selector(setSleep(_:))); i.representedObject = secs; i.tag = 100
-            sleepMenu.addItem(i)
-        }
-        sleepMenu.addItem(.separator())
-        sleepMenu.addItem(item("Şimdi Uyu", #selector(sleepNow)))
-        sleepItem.submenu = sleepMenu
-        m.addItem(sleepItem)
         m.addItem(.separator())
 
-        let upd = item("Güncellemeleri Kontrol Et", #selector(checkForUpdatesManually)); upd.tag = 46
+        // sadece yeni sürüm varken / güncellenirken görünür
+        let upd = item("✨ Güncelleme Var: Yükle", #selector(checkForUpdatesManually)); upd.tag = 46
+        upd.isHidden = true
         m.addItem(upd)
-        let login = item("Girişte Başlat", #selector(toggleLogin(_:))); login.tag = 42
-        m.addItem(login)
-        // İzinler: hepsi tek alt menüde; ✓ verilmiş olanları gösterir
-        let permItem = NSMenuItem(title: "İzinler", action: nil, keyEquivalent: "")
-        let permMenu = NSMenu()
-        let screenPerm = item("Ekran Kaydı (ekran görüntüsü için)…", #selector(openPrivacy)); screenPerm.tag = 400
-        let axPerm = item("Erişilebilirlik (çöp kutusu korkusu için)…", #selector(openAccessibility)); axPerm.tag = 401
-        permMenu.addItem(screenPerm)
-        permMenu.addItem(axPerm)
-        permMenu.addItem(.separator())
-        let note = NSMenuItem(title: "✓ olanlar verilmiş · değişiklikten sonra uygulamayı yeniden başlat", action: nil, keyEquivalent: "")
-        note.isEnabled = false
-        permMenu.addItem(note)
-        permItem.submenu = permMenu
-        m.addItem(permItem)
-        m.addItem(.separator())
+        let settingsItem = NSMenuItem(title: "Ayarlar…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        m.addItem(settingsItem)
         m.addItem(item("GooglyEyes Hakkında", #selector(showAbout)))
         m.addItem(NSMenuItem(title: "Çıkış", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         return m
@@ -270,29 +235,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        if let i = menu.item(withTag: 42) {
-            if #available(macOS 13.0, *) {
-                i.state = SMAppService.mainApp.status == .enabled ? .on : .off
-            } else { i.isHidden = true }
-        }
-        menu.item(withTag: 43)?.state = Pref.autoAnnotate ? .on : .off
-        menu.item(withTag: 44)?.state = Pref.randomBehaviors ? .on : .off
         if let i = menu.item(withTag: 47) {
             let hk = Hotkey.load()
             i.keyEquivalent = hk.menuKey
             i.keyEquivalentModifierMask = hk.cocoaMods
         }
-        menu.item(withTag: 45)?.state = Pref.webpToPng ? .on : .off
-        if let i = menu.item(withTag: 400) {
-            i.state = CGPreflightScreenCaptureAccess() ? .on : .off
+    }
+
+    // MARK: Ayarlar
+
+    @objc func openSettings() {
+        if settings == nil { settings = SettingsWindowController(app: self) }
+        NSApp.activate(ignoringOtherApps: true)
+        settings?.refresh()
+        settings?.showWindow(nil)
+        settings?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    func setLogin(_ on: Bool) {
+        guard #available(macOS 13.0, *) else { return }
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch {
+            alert("Girişte başlatma ayarlanamadı", error.localizedDescription)
         }
-        menu.item(withTag: 401)?.state = AXIsProcessTrusted() ? .on : .off
-        menu.item(withTag: 300)?.state = Pref.saveToDesktop ? .off : .on
-        menu.item(withTag: 301)?.state = Pref.saveToDesktop ? .on : .off
-        for i in menu.items { if let sub = i.submenu { menuWillOpen(sub) } }
-        for i in menu.items where i.tag == 100 {
-            i.state = (i.representedObject as? Double) == Pref.sleepAfter ? .on : .off
-        }
+    }
+
+    func setWebp(_ on: Bool) {
+        Pref.webpToPng = on
+        if on { webpWatcher.start() } else { webpWatcher.stop() }
+    }
+
+    /// Kısayol kutusu seçiliyken genel kısayolu geçici olarak kapat (yazarken ekran görüntüsü başlamasın)
+    func suspendHotKey() {
+        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
     }
 
     @objc func toggleAutoAnnotate() { Pref.autoAnnotate.toggle() }
@@ -328,9 +304,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Güncelleme
 
     func setUpdateMenu(_ title: String, enabled: Bool = true) {
-        guard let i = statusItem.menu?.item(withTag: 46) else { return }
-        i.title = title
-        i.isEnabled = enabled
+        if let i = statusItem.menu?.item(withTag: 46) {
+            i.title = title
+            i.isEnabled = enabled
+            i.isHidden = !(updateAvailable || updating)
+        }
+        settings?.refresh()
     }
 
     @objc func checkForUpdatesManually() {
@@ -730,7 +709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let hk = Hotkey.load()
         if applyHotKey(hk) != noErr {
             alert("\(hk.display) kısayolu kaydedilemedi",
-                  "Başka bir uygulama bu kısayolu kullanıyor olabilir. Menüden 'Kısayolu Değiştir…' ile başka bir tuş seçebilirsin.")
+                  "Başka bir uygulama bu kısayolu kullanıyor olabilir. Ayarlar'dan başka bir kısayol seçebilirsin.")
         }
     }
 
@@ -740,36 +719,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
         let id = EventHotKeyID(signature: OSType(0x47457965), id: 1) // 'GEye'
         return RegisterEventHotKey(hk.keyCode, hk.carbonMods, id, GetApplicationEventTarget(), 0, &hotKeyRef)
-    }
-
-    @objc func changeHotKey() {
-        let old = Hotkey.load()
-        // kayıt sırasında eski kısayol tetiklenmesin
-        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
-
-        let rec = HotkeyRecorder(frame: NSRect(x: 0, y: 0, width: 260, height: 44))
-        rec.hotkey = old
-        let a = NSAlert()
-        a.messageText = "Ekran görüntüsü kısayolu"
-        a.informativeText = "Kutuya tıkla ve yeni kısayola bas. En az bir tane ⌘, ⌥ ya da ⌃ içermeli (F tuşları tek başına olabilir)."
-        a.accessoryView = rec
-        a.addButton(withTitle: "Kaydet")
-        a.addButton(withTitle: "Vazgeç")
-        a.addButton(withTitle: "Varsayılan (⌥⇧S)")
-        a.window.initialFirstResponder = rec
-        NSApp.activate(ignoringOtherApps: true)
-        let r = a.runModal()
-
-        var chosen = old
-        if r == .alertFirstButtonReturn { chosen = rec.hotkey }
-        else if r == .alertThirdButtonReturn { chosen = Hotkey.defaultKey }
-        if applyHotKey(chosen) != noErr {
-            alert("\(chosen.display) kullanılamıyor",
-                  "Bu kısayolu başka bir uygulama kullanıyor. Eski kısayol (\(old.display)) geri yüklendi.")
-            applyHotKey(old)
-            return
-        }
-        chosen.save()
     }
 
     // MARK: Ekran görüntüsü
@@ -1083,10 +1032,13 @@ final class HotkeyRecorder: NSView {
     var hotkey = Hotkey.defaultKey { didSet { needsDisplay = true } }
     var hint: String? { didSet { needsDisplay = true } }
     var focused = false { didSet { needsDisplay = true } }
+    var onRecord: ((Hotkey) -> Void)?
+    var onFocus: ((Bool) -> Void)?
 
     override var acceptsFirstResponder: Bool { true }
-    override func becomeFirstResponder() -> Bool { focused = true; return true }
-    override func resignFirstResponder() -> Bool { focused = false; return true }
+    override var canBecomeKeyView: Bool { false }      // pencere açılınca kendiliğinden seçilmesin; tıklayınca seçilir
+    override func becomeFirstResponder() -> Bool { focused = true; onFocus?(true); return true }
+    override func resignFirstResponder() -> Bool { focused = false; onFocus?(false); return true }
     override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
 
     override func draw(_ dirty: NSRect) {
@@ -1116,6 +1068,7 @@ final class HotkeyRecorder: NSView {
         }
         hint = nil
         hotkey = Hotkey(keyCode: UInt32(e.keyCode), cocoaMods: mods, keyName: name)
+        onRecord?(hotkey)
         return true
     }
 
@@ -1123,6 +1076,225 @@ final class HotkeyRecorder: NSView {
     override func performKeyEquivalent(with e: NSEvent) -> Bool {
         guard window?.firstResponder === self, e.type == .keyDown else { return false }
         return record(e)
+    }
+}
+
+// MARK: - Ayarlar penceresi
+
+final class SettingsWindowController: NSWindowController, NSWindowDelegate {
+    weak var app: AppDelegate?
+
+    let recorder = HotkeyRecorder(frame: NSRect(x: 0, y: 0, width: 150, height: 36))
+    let hotkeyNote = NSTextField(labelWithString: "")
+    let savePopup = NSPopUpButton()
+    let annotateCheck = NSButton(checkboxWithTitle: "Çektikten sonra işaretleme penceresini aç", target: nil, action: nil)
+    let sleepPopup = NSPopUpButton()
+    let randomCheck = NSButton(checkboxWithTitle: "Rastgele davranışlar (göz devirme, spiral göz…)", target: nil, action: nil)
+    let webpCheck = NSButton(checkboxWithTitle: "İndirilen WebP görselleri otomatik PNG'ye çevir", target: nil, action: nil)
+    let loginCheck = NSButton(checkboxWithTitle: "Mac açılınca GooglyEyes'ı başlat", target: nil, action: nil)
+    let screenStatus = NSTextField(labelWithString: "")
+    let screenButton = NSButton(title: "İzin Ver…", target: nil, action: nil)
+    let axStatus = NSTextField(labelWithString: "")
+    let axButton = NSButton(title: "İzin Ver…", target: nil, action: nil)
+    let versionLabel = NSTextField(labelWithString: "")
+    let updateButton = NSButton(title: "Güncellemeleri Kontrol Et", target: nil, action: nil)
+
+    static let sleepOptions: [(String, Double)] = [("30 saniye sonra", 30), ("1 dakika sonra", 60), ("5 dakika sonra", 300), ("Kapalı", 0)]
+
+    init(app: AppDelegate) {
+        self.app = app
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 520),
+                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        win.title = "GooglyEyes Ayarlar"
+        win.isReleasedWhenClosed = false
+        super.init(window: win)
+        win.delegate = self
+        build()
+        win.center()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    // MARK: Kurulum
+
+    func label(_ t: String) -> NSTextField {
+        let l = NSTextField(labelWithString: t)
+        l.alignment = .right
+        return l
+    }
+
+    func section(_ t: String) -> NSTextField {
+        let l = NSTextField(labelWithString: t)
+        l.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        return l
+    }
+
+    func row(_ views: [NSView]) -> NSStackView {
+        let s = NSStackView(views: views)
+        s.spacing = 8
+        s.alignment = .centerY
+        return s
+    }
+
+    func build() {
+        guard let content = window?.contentView else { return }
+
+        // kısayol
+        recorder.translatesAutoresizingMaskIntoConstraints = false
+        recorder.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        recorder.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        recorder.onFocus = { [weak self] focused in
+            guard let app = self?.app else { return }
+            if focused {
+                app.suspendHotKey()
+                self?.hotkeyNote.stringValue = "Yeni kısayola bas…"
+                self?.hotkeyNote.textColor = .secondaryLabelColor
+            } else {
+                app.applyHotKey(Hotkey.load())
+                if self?.hotkeyNote.textColor != .systemRed { self?.hotkeyNote.stringValue = "" }
+            }
+        }
+        recorder.onRecord = { [weak self] hk in self?.tryHotKey(hk) }
+        hotkeyNote.font = NSFont.systemFont(ofSize: 11)
+        let resetKey = NSButton(title: "Varsayılan", target: self, action: #selector(resetHotKey))
+        resetKey.controlSize = .small
+
+        // kaydetme
+        savePopup.addItems(withTitles: ["Sadece panoya", "Panoya + masaüstüne"])
+        savePopup.target = self; savePopup.action = #selector(saveChanged)
+        annotateCheck.target = self; annotateCheck.action = #selector(annotateChanged)
+
+        // gözler
+        sleepPopup.addItems(withTitles: Self.sleepOptions.map { $0.0 })
+        sleepPopup.target = self; sleepPopup.action = #selector(sleepChanged)
+        randomCheck.target = self; randomCheck.action = #selector(randomChanged)
+
+        // dosyalar / genel
+        webpCheck.target = self; webpCheck.action = #selector(webpChanged)
+        loginCheck.target = self; loginCheck.action = #selector(loginChanged)
+        screenButton.target = self; screenButton.action = #selector(askScreen)
+        axButton.target = self; axButton.action = #selector(askAX)
+        for b in [screenButton, axButton] { b.controlSize = .small }
+        let permNote = NSTextField(labelWithString: "İzin verdikten sonra GooglyEyes'ı kapatıp yeniden aç.")
+        permNote.font = NSFont.systemFont(ofSize: 11); permNote.textColor = .secondaryLabelColor
+
+        // güncelleme
+        updateButton.target = self; updateButton.action = #selector(checkUpdates)
+
+        let e = NSGridCell.emptyContentView
+        let rows: [[NSView]] = [
+            [section("Ekran Görüntüsü"), e],
+            [label("Kısayol:"), row([recorder, resetKey, hotkeyNote])],
+            [label("Kaydet:"), savePopup],
+            [e, annotateCheck],
+            [section("Gözler"), e],
+            [label("Uyku:"), sleepPopup],
+            [e, randomCheck],
+            [section("Dosyalar"), e],
+            [e, webpCheck],
+            [section("Genel"), e],
+            [e, loginCheck],
+            [label("Ekran Kaydı:"), row([screenStatus, screenButton])],
+            [label("Erişilebilirlik:"), row([axStatus, axButton])],
+            [e, permNote],
+            [section("Güncelleme"), e],
+            [label("Sürüm:"), row([versionLabel, updateButton])],
+        ]
+        let grid = NSGridView(views: rows)
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.rowSpacing = 9
+        grid.columnSpacing = 10
+        grid.column(at: 0).xPlacement = .trailing
+        grid.rowAlignment = .firstBaseline
+        for (i, r) in rows.enumerated() where r[1] === e && r[0] is NSTextField && (r[0] as! NSTextField).font?.pointSize == 13 {
+            let gr = grid.row(at: i)
+            gr.mergeCells(in: NSRange(location: 0, length: 2))
+            gr.cell(at: 0).xPlacement = .leading
+            if i > 0 { gr.topPadding = 12 }
+        }
+        content.addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            grid.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -24),
+            grid.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+        ])
+        if #unavailable(macOS 13.0) { loginCheck.isHidden = true }
+    }
+
+    // MARK: Değerleri göster
+
+    func refresh() {
+        guard let app = app else { return }
+        if !recorder.focused { recorder.hotkey = Hotkey.load() }
+        savePopup.selectItem(at: Pref.saveToDesktop ? 1 : 0)
+        annotateCheck.state = Pref.autoAnnotate ? .on : .off
+        sleepPopup.selectItem(at: Self.sleepOptions.firstIndex { $0.1 == Pref.sleepAfter } ?? 1)
+        randomCheck.state = Pref.randomBehaviors ? .on : .off
+        webpCheck.state = Pref.webpToPng ? .on : .off
+        if #available(macOS 13.0, *) { loginCheck.state = SMAppService.mainApp.status == .enabled ? .on : .off }
+
+        let screenOK = CGPreflightScreenCaptureAccess(), axOK = AXIsProcessTrusted()
+        screenStatus.stringValue = screenOK ? "Verildi ✓" : "Verilmedi"
+        screenStatus.textColor = screenOK ? .systemGreen : .secondaryLabelColor
+        screenButton.isHidden = screenOK
+        axStatus.stringValue = axOK ? "Verildi ✓" : "Verilmedi"
+        axStatus.textColor = axOK ? .systemGreen : .secondaryLabelColor
+        axButton.isHidden = axOK
+
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        let commit = Updater.installedCommit
+        versionLabel.stringValue = "\(version) (\(commit == "unknown" ? "yerel derleme" : String(commit.prefix(7))))"
+        if app.updating {
+            updateButton.title = "Güncelleniyor…"; updateButton.isEnabled = false
+        } else if app.updateAvailable {
+            updateButton.title = "✨ Güncellemeyi Yükle"; updateButton.isEnabled = true
+        } else {
+            updateButton.title = "Güncellemeleri Kontrol Et"; updateButton.isEnabled = true
+        }
+    }
+
+    func windowDidBecomeKey(_ n: Notification) { refresh() }   // izin ekranından dönünce durumu tazele
+
+    // MARK: Eylemler
+
+    func tryHotKey(_ hk: Hotkey) {
+        guard let app = app else { return }
+        let old = Hotkey.load()
+        // gerçekten kaydedilebiliyor mu dene, sonra kutu seçili kaldıkça tekrar kapat
+        if app.applyHotKey(hk) == noErr {
+            hk.save()
+            hotkeyNote.stringValue = "Kaydedildi ✓"
+            hotkeyNote.textColor = .systemGreen
+        } else {
+            recorder.hotkey = old
+            hotkeyNote.stringValue = "\(hk.display) başka bir uygulamada kullanılıyor"
+            hotkeyNote.textColor = .systemRed
+        }
+        if recorder.focused { app.suspendHotKey() } else { app.applyHotKey(Hotkey.load()) }
+    }
+
+    @objc func resetHotKey() {
+        window?.makeFirstResponder(nil)
+        tryHotKey(Hotkey.defaultKey)
+        recorder.hotkey = Hotkey.load()
+    }
+
+    @objc func saveChanged() { Pref.saveToDesktop = savePopup.indexOfSelectedItem == 1 }
+    @objc func annotateChanged() { Pref.autoAnnotate = annotateCheck.state == .on }
+    @objc func sleepChanged() {
+        Pref.sleepAfter = Self.sleepOptions[sleepPopup.indexOfSelectedItem].1
+        app?.lastActivity = CACurrentMediaTime()
+    }
+    @objc func randomChanged() { Pref.randomBehaviors = randomCheck.state == .on }
+    @objc func webpChanged() { app?.setWebp(webpCheck.state == .on) }
+    @objc func loginChanged() { app?.setLogin(loginCheck.state == .on); refresh() }
+    @objc func askScreen() { _ = CGRequestScreenCaptureAccess(); app?.openPrivacy() }
+    @objc func askAX() { app?.openAccessibility() }
+    @objc func checkUpdates() { app?.checkForUpdatesManually() }
+
+    func windowWillClose(_ n: Notification) {
+        window?.makeFirstResponder(nil)          // kutu seçiliyse kısayolu geri aç
+        app?.applyHotKey(Hotkey.load())
     }
 }
 

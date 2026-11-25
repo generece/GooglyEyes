@@ -13,7 +13,7 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 - Şaşırma: ekran görüntüsü alırken ve panoya bir şey kopyalanınca göz bebekleri büyür
 - Çöp kutusu korkusu: mouse Dock'taki çöp kutusunun üstündeyken ya da Çöp Sepeti açıkken göz bebekleri küçülür ve titrer (Erişilebilirlik izni gerekir)
 
-**Ekran görüntüsü — ⌥⇧S** (menüden *Kısayolu Değiştir…* ile değiştirilebilir)
+**Ekran görüntüsü — ⌥⇧S** (Ayarlar'dan değiştirilebilir)
 - Bölge seçimi; birden fazla ekranda çalışır
 - Kısayola basıldığı an ekran dondurulur; açık menüler/açılır pencereler kapansa bile görüntü o anın hali olur
 - Menüden seçilir: sadece panoya ya da panoya + masaüstüne
@@ -46,9 +46,13 @@ Script son sürümü indirir, bu Mac'te derler, `~/Applications/GooglyEyes.app` 
 
 > ⌥⇧S başka bir uygulamada ya da Kestirmeler (Shortcuts) uygulamasında tanımlıysa çakışır; önce onu kaldır.
 
+## Ayarlar
+
+Gözlere tıkla → **Ayarlar…**: ekran görüntüsü kısayolu, kaydetme yeri (sadece pano / pano + masaüstü), işaretlemeyi otomatik açma, uyku süresi, rastgele davranışlar, WebP → PNG, girişte başlatma ve izinlerin durumu.
+
 ## Güncelleme
 
-Gözlere tıkla → **Güncellemeleri Kontrol Et**. Yeni sürüm varsa tek tıkla indirilir, kurulur ve uygulama yeniden açılır. Uygulama açılışta da bir kez bakar; yeni sürüm varsa menüde **✨ Güncelleme Var** yazar. Güncelleme asla kendiliğinden yapılmaz, sen onaylamadan hiçbir şey indirilmez.
+Ayarlar → **Güncellemeleri Kontrol Et**. Yeni sürüm varsa tek tıkla indirilir, kurulur ve uygulama yeniden açılır. Uygulama açılışta da bir kez bakar; yeni sürüm varsa menüde **✨ Güncelleme Var** yazar. Güncelleme asla kendiliğinden yapılmaz, sen onaylamadan hiçbir şey indirilmez.
 
 Kaynak koddan elle derlemek için: `bash build.sh`
 
