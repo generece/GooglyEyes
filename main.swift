@@ -162,6 +162,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var previousApp: NSRunningApplication?
     var annotationWindows: [AnnotationWindowController] = []
     var lastDrawKey = ""
+    var lastBusy: CFTimeInterval = 0
+    var currentFPS: Double = 0
 
     // görsel boyutlar (pt) — göz boyu menü çubuğu yüksekliğine göre ayarlanır
     var eyeSize: CGFloat = 22
@@ -201,8 +203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupDropTarget()
         installEditMenu()
 
-        timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
-        RunLoop.main.add(timer!, forMode: .common)
+        setFrameRate(60)
 
         // Ekranın herhangi bir yerinde tık: sol → sol göz, sağ → sağ göz
         globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] e in
@@ -570,7 +571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mouse = NSEvent.mouseLocation
 
         // çöp kutusu korkusu: Dock'taki çöp kutusunun üstündeyken ya da çöp kutusu penceresi açıkken
-        if now - lastTrashCheck > 0.4 {
+        if now - lastTrashCheck > 1.0 {
             lastTrashCheck = now
             trashOpen = TrashWatch.trashWindowOpen()
         }
@@ -663,14 +664,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var key = [leftEye, rightEye].map {
             String(format: "%.2f,%.2f,%d", $0.pos.x, $0.pos.y, $0.isClosed ? 1 : 0)
         }.joined(separator: "|") + String(format: "|%.3f|%d|%.3f", sAmt, sleeping ? 1 : 0, fear)
-        if sleeping { key += "|\(Int(now * 30))" }
+        if sleeping { key += "|\(Int(now * 12))" }
         if special == .spiral || fear > 0.01 { key += "|s\(Int(now * 60))" }
         key += String(format: "|d%.3f|c%d|g%d|b%d", droop, Pref.eyeColor, Pref.glasses, Pref.brows)
         if now < tintUntil { key += "|t\(Int(now * 10))" }
         if recording { key += "|r\(Int(now * 3))" }
-        if key == lastDrawKey { return }
+        // Pil dostu: hareket yokken saniyede 10 kare, bir şey değişince hemen 60 kareye çık
+        let changed = key != lastDrawKey
+        if changed { lastBusy = now }
+        let idle = sleeping || now - lastBusy > 1.5
+        setFrameRate(idle ? (sleeping ? 12 : 10) : 60)
+        if !changed { return }
         lastDrawKey = key
         button.image = renderEyes(now: now, surprise: sAmt)
+    }
+
+    /// Animasyon zamanlayıcısının hızını değiştir (aynıysa dokunma)
+    func setFrameRate(_ fps: Double) {
+        if fps == currentFPS, timer != nil { return }
+        currentFPS = fps
+        timer?.invalidate()
+        let t = Timer(timeInterval: 1.0 / fps, repeats: true) { [weak self] _ in self?.tick() }
+        t.tolerance = 0.2 / fps              // sistemin uyanmaları birleştirmesine izin ver
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     func renderEyes(now: CFTimeInterval, surprise s: CGFloat) -> NSImage {
