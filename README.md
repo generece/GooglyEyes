@@ -13,7 +13,7 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 - Şaşırma: ekran görüntüsü alırken ve panoya bir şey kopyalanınca göz bebekleri büyür
 - Çöp kutusu korkusu: mouse Dock'taki çöp kutusunun üstündeyken ya da Çöp Sepeti açıkken göz bebekleri küçülür ve titrer (Erişilebilirlik izni gerekir)
 
-**Ekran görüntüsü — ⌥⇧S**
+**Ekran görüntüsü — ⌥⇧S** (menüden *Kısayolu Değiştir…* ile değiştirilebilir)
 - Bölge seçimi; birden fazla ekranda çalışır
 - Kısayola basıldığı an ekran dondurulur; açık menüler/açılır pencereler kapansa bile görüntü o anın hali olur
 - Menüden seçilir: sadece panoya ya da panoya + masaüstüne

@@ -198,12 +198,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func buildMenu() -> NSMenu {
         let m = NSMenu()
         m.delegate = self
-        let shot = NSMenuItem(title: "Bölge Ekran Görüntüsü Al", action: #selector(captureRegion), keyEquivalent: "s")
-        shot.keyEquivalentModifierMask = [.option, .shift]
-        shot.target = self
+        let shot = NSMenuItem(title: "Bölge Ekran Görüntüsü Al", action: #selector(captureRegion), keyEquivalent: "")
+        shot.target = self; shot.tag = 47
         m.addItem(shot)
+        m.addItem(item("Kısayolu Değiştir…", #selector(changeHotKey)))
         m.addItem(item("Panodaki Görseli Aç ve İşaretle…", #selector(openAnnotatorFromClipboard)))
-        let auto = item("⌥⇧S Sonrası İşaretlemeyi Aç", #selector(toggleAutoAnnotate)); auto.tag = 43
+        let auto = item("Ekran Görüntüsünden Sonra İşaretlemeyi Aç", #selector(toggleAutoAnnotate)); auto.tag = 43
         m.addItem(auto)
         let saveItem = NSMenuItem(title: "Ekran Görüntüsünü Kaydet", action: nil, keyEquivalent: "")
         let saveMenu = NSMenu()
@@ -277,6 +277,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.item(withTag: 43)?.state = Pref.autoAnnotate ? .on : .off
         menu.item(withTag: 44)?.state = Pref.randomBehaviors ? .on : .off
+        if let i = menu.item(withTag: 47) {
+            let hk = Hotkey.load()
+            i.keyEquivalent = hk.menuKey
+            i.keyEquivalentModifierMask = hk.cocoaMods
+        }
         menu.item(withTag: 45)?.state = Pref.webpToPng ? .on : .off
         if let i = menu.item(withTag: 400) {
             i.state = CGPreflightScreenCaptureAccess() ? .on : .off
@@ -712,7 +717,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func blinkBoth() { leftEye.blink(); rightEye.blink() }
 
-    // MARK: Kısayol ⌥⇧S
+    // MARK: Kısayol (varsayılan ⌥⇧S, menüden değiştirilebilir)
 
     func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -722,12 +727,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { me.captureRegion() }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
-        let id = EventHotKeyID(signature: OSType(0x47457965), id: 1) // 'GEye'
-        let status = RegisterEventHotKey(UInt32(kVK_ANSI_S), UInt32(optionKey | shiftKey), id,
-                                         GetApplicationEventTarget(), 0, &hotKeyRef)
-        if status != noErr {
-            alert("⌥⇧S kısayolu kaydedilemedi", "Başka bir uygulama bu kısayolu kullanıyor olabilir. Menüden de ekran görüntüsü alabilirsin.")
+        let hk = Hotkey.load()
+        if applyHotKey(hk) != noErr {
+            alert("\(hk.display) kısayolu kaydedilemedi",
+                  "Başka bir uygulama bu kısayolu kullanıyor olabilir. Menüden 'Kısayolu Değiştir…' ile başka bir tuş seçebilirsin.")
         }
+    }
+
+    /// Kısayolu (yeniden) kaydet; başarılıysa noErr döner
+    @discardableResult
+    func applyHotKey(_ hk: Hotkey) -> OSStatus {
+        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
+        let id = EventHotKeyID(signature: OSType(0x47457965), id: 1) // 'GEye'
+        return RegisterEventHotKey(hk.keyCode, hk.carbonMods, id, GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    @objc func changeHotKey() {
+        let old = Hotkey.load()
+        // kayıt sırasında eski kısayol tetiklenmesin
+        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
+
+        let rec = HotkeyRecorder(frame: NSRect(x: 0, y: 0, width: 260, height: 44))
+        rec.hotkey = old
+        let a = NSAlert()
+        a.messageText = "Ekran görüntüsü kısayolu"
+        a.informativeText = "Kutuya tıkla ve yeni kısayola bas. En az bir tane ⌘, ⌥ ya da ⌃ içermeli (F tuşları tek başına olabilir)."
+        a.accessoryView = rec
+        a.addButton(withTitle: "Kaydet")
+        a.addButton(withTitle: "Vazgeç")
+        a.addButton(withTitle: "Varsayılan (⌥⇧S)")
+        a.window.initialFirstResponder = rec
+        NSApp.activate(ignoringOtherApps: true)
+        let r = a.runModal()
+
+        var chosen = old
+        if r == .alertFirstButtonReturn { chosen = rec.hotkey }
+        else if r == .alertThirdButtonReturn { chosen = Hotkey.defaultKey }
+        if applyHotKey(chosen) != noErr {
+            alert("\(chosen.display) kullanılamıyor",
+                  "Bu kısayolu başka bir uygulama kullanıyor. Eski kısayol (\(old.display)) geri yüklendi.")
+            applyHotKey(old)
+            return
+        }
+        chosen.save()
     }
 
     // MARK: Ekran görüntüsü
@@ -891,7 +933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openAnnotatorFromClipboard() {
         guard let img = NSImage(pasteboard: NSPasteboard.general), img.size.width > 0 else {
-            alert("Panoda görsel yok", "Önce ⌥⇧S ile bir ekran görüntüsü al ya da bir görsel kopyala.")
+            alert("Panoda görsel yok", "Önce \(Hotkey.load().display) ile bir ekran görüntüsü al ya da bir görsel kopyala.")
             return
         }
         openAnnotator(with: img)
@@ -970,6 +1012,117 @@ enum TrashWatch {
                 && (w[kCGWindowLayer as String] as? Int) == 0
                 && trashNames.contains(w[kCGWindowName as String] as? String ?? "")
         }
+    }
+}
+
+// MARK: - Kısayol
+
+struct Hotkey {
+    var keyCode: UInt32
+    var cocoaMods: NSEvent.ModifierFlags
+    var keyName: String
+
+    static let defaultKey = Hotkey(keyCode: UInt32(kVK_ANSI_S), cocoaMods: [.option, .shift], keyName: "S")
+
+    static func load() -> Hotkey {
+        let d = UserDefaults.standard
+        guard d.object(forKey: "hkCode") != nil, let name = d.string(forKey: "hkName") else { return defaultKey }
+        return Hotkey(keyCode: UInt32(d.integer(forKey: "hkCode")),
+                      cocoaMods: NSEvent.ModifierFlags(rawValue: UInt(d.integer(forKey: "hkMods"))),
+                      keyName: name)
+    }
+
+    func save() {
+        let d = UserDefaults.standard
+        d.set(Int(keyCode), forKey: "hkCode")
+        d.set(Int(cocoaMods.rawValue), forKey: "hkMods")
+        d.set(keyName, forKey: "hkName")
+    }
+
+    var carbonMods: UInt32 {
+        var m = 0
+        if cocoaMods.contains(.command) { m |= cmdKey }
+        if cocoaMods.contains(.option) { m |= optionKey }
+        if cocoaMods.contains(.control) { m |= controlKey }
+        if cocoaMods.contains(.shift) { m |= shiftKey }
+        return UInt32(m)
+    }
+
+    var display: String {
+        var s = ""
+        if cocoaMods.contains(.control) { s += "⌃" }
+        if cocoaMods.contains(.option) { s += "⌥" }
+        if cocoaMods.contains(.shift) { s += "⇧" }
+        if cocoaMods.contains(.command) { s += "⌘" }
+        return s + keyName
+    }
+
+    /// Menüde gösterilecek tuş (tek karakterli tuşlar için)
+    var menuKey: String { keyName.count == 1 ? keyName.lowercased() : "" }
+
+    static let fKeys: [UInt16: String] = [122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6",
+                                          98: "F7", 100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12"]
+
+    static func name(for e: NSEvent) -> String? {
+        if let f = fKeys[e.keyCode] { return f }
+        switch e.keyCode {
+        case 49: return "Space"
+        case 36, 76: return "↩"
+        case 48: return "⇥"
+        case 51, 53: return nil          // sil ve Esc kullanılamaz
+        default: break
+        }
+        // tuşun kendisi (shift/option'ın değiştirdiği karakter değil)
+        guard let c = e.charactersIgnoringModifiers?.uppercased(), !c.isEmpty else { return nil }
+        return c
+    }
+}
+
+/// Basılan tuş kombinasyonunu yakalayan kutu
+final class HotkeyRecorder: NSView {
+    var hotkey = Hotkey.defaultKey { didSet { needsDisplay = true } }
+    var hint: String? { didSet { needsDisplay = true } }
+    var focused = false { didSet { needsDisplay = true } }
+
+    override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool { focused = true; return true }
+    override func resignFirstResponder() -> Bool { focused = false; return true }
+    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
+
+    override func draw(_ dirty: NSRect) {
+        let r = bounds.insetBy(dx: 1, dy: 4)
+        let p = NSBezierPath(roundedRect: r, xRadius: 7, yRadius: 7)
+        NSColor.controlBackgroundColor.setFill(); p.fill()
+        p.lineWidth = focused ? 2 : 1
+        (focused ? NSColor.controlAccentColor : NSColor.separatorColor).setStroke(); p.stroke()
+        let text = hint ?? hotkey.display
+        let s = NSAttributedString(string: text, attributes: [
+            .font: hint == nil ? NSFont.systemFont(ofSize: 17, weight: .semibold) : NSFont.systemFont(ofSize: 12),
+            .foregroundColor: hint == nil ? NSColor.labelColor : NSColor.systemRed])
+        let sz = s.size()
+        s.draw(at: NSPoint(x: r.midX - sz.width / 2, y: r.midY - sz.height / 2))
+    }
+
+    /// true: tuşu biz aldık
+    func record(_ e: NSEvent) -> Bool {
+        let mods = e.modifierFlags.intersection([.command, .option, .control, .shift])
+        // düz Enter / Esc / Tab pencerenin düğmelerine gitsin
+        if mods.isEmpty && [36, 76, 53, 48].contains(e.keyCode) { return false }
+        guard let name = Hotkey.name(for: e) else { return false }
+        let isF = Hotkey.fKeys[e.keyCode] != nil
+        if !isF && mods.intersection([.command, .option, .control]).isEmpty {
+            hint = "⌘, ⌥ ya da ⌃ ile birlikte bas"
+            return true
+        }
+        hint = nil
+        hotkey = Hotkey(keyCode: UInt32(e.keyCode), cocoaMods: mods, keyName: name)
+        return true
+    }
+
+    override func keyDown(with e: NSEvent) { if !record(e) { super.keyDown(with: e) } }
+    override func performKeyEquivalent(with e: NSEvent) -> Bool {
+        guard window?.firstResponder === self, e.type == .keyDown else { return false }
+        return record(e)
     }
 }
 
