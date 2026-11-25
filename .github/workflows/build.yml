@@ -34,5 +34,5 @@ jobs:
           VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)
           gh release create "v$VER-$SHORT" dist/GooglyEyes.zip \
             --title "GooglyEyes $VER ($SHORT)" \
-            --notes "$(git log -1 --pretty=%s)" \
+            --notes-file RELEASE_NOTES.md \
             --target "$GITHUB_SHA" --latest

@@ -150,6 +150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var frozen: [CGDirectDisplayID: CGImage] = [:]
     let webpWatcher = WebpWatcher()
     var updateAvailable = false
+    var latestNotes = ""
     var settings: SettingsWindowController?
     var updating = false
 
@@ -378,16 +379,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func checkForUpdates(manual: Bool) {
         if updating { return }
         if manual { setUpdateMenu("Kontrol ediliyor…", enabled: false) }
-        Updater.latestCommit { [weak self] latest in
+        Updater.latestRelease { [weak self] rel in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                guard let latest = latest else {
+                guard let latest = rel?.commit else {
                     self.setUpdateMenu("Güncellemeleri Kontrol Et")
                     if manual { self.alert("Kontrol edilemedi", "GitHub'a ulaşılamadı. İnternet bağlantını kontrol edip tekrar dene.") }
                     return
                 }
                 if !Updater.installedCommit.hasPrefix(latest) {
                     self.updateAvailable = true
+                    self.latestNotes = rel?.notes ?? ""
                     self.setUpdateMenu("✨ Güncelleme Var: Yükle")
                     self.surprise(0.8)
                     if manual { self.confirmUpdate() }
@@ -403,8 +405,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func confirmUpdate() {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
-        a.messageText = "Yeni sürüm hazır"
-        a.informativeText = "GooglyEyes son sürümü indirip bu Mac'te kuracak ve kendini yeniden başlatacak. Bu 10–30 saniye sürebilir."
+        a.messageText = "Yeni sürüm hazır ✨"
+        let notes = latestNotes.count > 900 ? String(latestNotes.prefix(900)) + "…" : latestNotes
+        a.informativeText = (notes.isEmpty ? "" : "Yenilikler:\n\(notes)\n\n")
+            + "Güncelle'ye basınca GooglyEyes yeni sürümü kurup kendini yeniden başlatır (birkaç saniye)."
         a.addButton(withTitle: "Güncelle")
         a.addButton(withTitle: "Sonra")
         guard a.runModal() == .alertFirstButtonReturn else { return }
@@ -2169,8 +2173,8 @@ enum Updater {
         Bundle.main.object(forInfoDictionaryKey: "GooglyCommit") as? String ?? "unknown"
     }
 
-    /// En son yayınlanan hazır sürümün commit'i (kısa, 7 karakter). Etiket biçimi: v1.1-abc1234
-    static func latestCommit(_ completion: @escaping (String?) -> Void) {
+    /// En son yayınlanan hazır sürüm: commit (kısa, 7 karakter; etiket biçimi v1.1-abc1234) ve yenilikler
+    static func latestRelease(_ completion: @escaping ((commit: String, notes: String)?) -> Void) {
         var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -2179,7 +2183,8 @@ enum Updater {
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tag = obj["tag_name"] as? String,
                   let short = tag.split(separator: "-").last, short.count >= 7 else { completion(nil); return }
-            completion(String(short))
+            let notes = (obj["body"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            completion((String(short), notes))
         }.resume()
     }
 

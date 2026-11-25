@@ -52,7 +52,9 @@ Gözlere tıkla → **Ayarlar…**: ekran görüntüsü kısayolu, kaydetme yeri
 
 ## Güncelleme
 
-Ayarlar → **Güncellemeleri Kontrol Et**. Yeni sürüm varsa tek tıkla indirilir, kurulur ve uygulama yeniden açılır. Uygulama açılışta da bir kez bakar; yeni sürüm varsa menüde **✨ Güncelleme Var** yazar. Güncelleme asla kendiliğinden yapılmaz, sen onaylamadan hiçbir şey indirilmez.
+Gözlere tıkla → **Güncellemeleri Kontrol Et** (Ayarlar'da da var). Yeni sürüm varsa tek tıkla indirilir, kurulur ve uygulama yeniden açılır. Uygulama açılışta da bir kez bakar; yeni sürüm varsa menüde **✨ Güncelleme Var** yazar. Güncelleme asla kendiliğinden yapılmaz, sen onaylamadan hiçbir şey indirilmez.
+
+Her güncellemede `RELEASE_NOTES.md`'deki yenilikler, güncelleme penceresinde kullanıcıya gösterilir.
 
 Her `main` push'unda GitHub Actions uygulamayı Apple Silicon + Intel için derleyip yayınlar. Kaynak koddan kendin derlemek istersen (Xcode Command Line Tools gerekir): `bash build.sh`
 
