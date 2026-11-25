@@ -1,3 +1,4 @@
-• Yeni kaşlar: kemerli, kızgın, endişeli, neşeli; göz akının üstünde durur (Ayarlar → Gözler)
-• Ayarlar → Genel'e "İzinleri Sıfırla" eklendi: izin verilmiş görünüp çalışmıyorsa tek tıkla düzeltir
-• Daha az pil tüketimi
+• Ekran kaydında görünür "■ Durdur" düğmesi ve süre göstergesi
+• İşaretleme penceresine Renk seç ve Metni kopyala araçları eklendi
+• Metni Kopyala ana menüden kaldırıldı (kısayolu ⌥⇧T ve işaretleme aracı duruyor)
+• Yeni kaşlar göz akının üstünde; Ayarlar → Genel'de İzinleri Sıfırla

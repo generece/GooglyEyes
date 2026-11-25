@@ -142,6 +142,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var recorderBox: AnyObject?            // RegionRecorder (macOS 13+)
     var recordBorder: NSWindow?
     var recordStopTimer: Timer?
+    var recordControl: NSPanel?
+    var recordClock: Timer?
     var droop: CGFloat = 0                 // ortama göre uykulu göz kapağı (0…1)
     var droopTarget: CGFloat = 0
     var lastAmbientCheck: CFTimeInterval = -100
@@ -258,7 +260,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.delegate = self
         for (title, action, tag) in [("Bölge Ekran Görüntüsü Al", #selector(captureRegion), 47),
                                      ("Renk Seç (HEX kopyala)", #selector(pickColor), 48),
-                                     ("Metni Kopyala (OCR)", #selector(captureText), 49),
                                      ("Ekran Kaydı Başlat", #selector(toggleRecording), 50)] {
             let i = item(title, action); i.tag = tag
             m.addItem(i)
@@ -1900,6 +1901,7 @@ extension AppDelegate {
         w.contentView = RecordBorderView(frame: NSRect(origin: .zero, size: frame.size))
         w.orderFrontRegardless()
         recordBorder = w
+        showRecordControl(near: r)
 
         // kayıt sürerken gözlere tıklamak kaydı durdurur
         statusItem.menu = nil
@@ -1925,15 +1927,64 @@ extension AppDelegate {
             self?.toast("1 dakika doldu, kayıt durduruldu")
             self?.stopRecording()
         }
-        toast("Kayıt başladı · durdurmak için gözlere tıkla")
+        toast("Kayıt başladı")
     }
 
     @objc func stopRecordingFromClick() { stopRecording() }
+
+    /// Kaydedilen alanın altında (yer yoksa üstünde) süre ve "Durdur" düğmesi
+    func showRecordControl(near r: NSRect) {
+        let w: CGFloat = 170, h: CGFloat = 36
+        let screen = NSScreen.screens.first { NSMouseInRect(NSPoint(x: r.midX, y: r.midY), $0.frame, false) } ?? NSScreen.main
+        let vf = screen?.visibleFrame ?? r
+        var y = r.minY - h - 12
+        if y < vf.minY + 4 { y = min(r.maxY + 12, vf.maxY - h - 4) }
+        let x = min(max(r.midX - w / 2, vf.minX + 4), vf.maxX - w - 4)
+        let p = NSPanel(contentRect: NSRect(x: x, y: y, width: w, height: h),
+                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        p.becomesKeyOnlyIfNeeded = true
+
+        let bg = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        bg.wantsLayer = true
+        bg.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.85).cgColor
+        bg.layer?.cornerRadius = h / 2
+        let dot = NSView(frame: NSRect(x: 14, y: h / 2 - 5, width: 10, height: 10))
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = NSColor.systemRed.cgColor
+        dot.layer?.cornerRadius = 5
+        let time = NSTextField(labelWithString: "0:00")
+        time.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium)
+        time.textColor = .white
+        time.frame = NSRect(x: 30, y: (h - 18) / 2, width: 44, height: 18)
+        let stop = NSButton(title: "■ Durdur", target: self, action: #selector(stopRecordingFromClick))
+        stop.bezelStyle = .rounded
+        stop.controlSize = .regular
+        stop.frame = NSRect(x: w - 88, y: (h - 26) / 2, width: 80, height: 26)
+        stop.keyEquivalent = "\u{1b}"                 // Esc da durdurur (pencere seçiliyse)
+        for v in [dot, time, stop] { bg.addSubview(v) }
+        p.contentView = bg
+        p.orderFrontRegardless()
+        recordControl = p
+
+        recordClock = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let s = Int(CACurrentMediaTime() - self.recordStart)
+            time.stringValue = String(format: "%d:%02d", s / 60, s % 60)
+            dot.alphaValue = s % 2 == 0 ? 1 : 0.35
+        }
+    }
 
     func cleanupRecordingUI() {
         recording = false
         recordStopTimer?.invalidate(); recordStopTimer = nil
         recordBorder?.orderOut(nil); recordBorder = nil
+        recordControl?.orderOut(nil); recordControl = nil
+        recordClock?.invalidate(); recordClock = nil
         statusItem.button?.action = nil
         statusItem.menu = buildMenu()
         lastDrawKey = ""
@@ -2606,7 +2657,7 @@ enum Output {
 // MARK: - İşaretleme görünümü
 
 /// Sıra, araç çubuğundaki düğme sırasıyla aynı olmalı
-enum Tool: Int { case pen, arrow, rect, marker, text, emoji, number, ruler, pixelate, blur, eraser, crop }
+enum Tool: Int { case pen, arrow, rect, marker, text, emoji, number, ruler, eyedropper, ocr, pixelate, blur, eraser, crop }
 
 /// Yazı aracı için font seçenekleri
 enum TextFont: Int, CaseIterable {
@@ -2790,6 +2841,22 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
     var onChange: (() -> Void)?
     var onCommand: ((String) -> Void)?
     var onCropped: ((Bool) -> Void)?
+    var onPickColor: ((NSColor) -> Void)?
+    var onStatus: ((String) -> Void)?
+
+    /// Görseldeki bir pikselin rengi (p: görsel pikseli, sol-alt orijin)
+    func pixelColor(at p: CGPoint) -> NSColor? {
+        guard fullRect.contains(p), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let sx = CGFloat(cg.width) / pixelSize.width, sy = CGFloat(cg.height) / pixelSize.height
+        let x = Int(p.x * sx), y = Int((pixelSize.height - p.y) * sy)
+        guard let px = cg.cropping(to: CGRect(x: min(x, cg.width - 1), y: min(max(y, 0), cg.height - 1), width: 1, height: 1)) else { return nil }
+        var rgba = [UInt8](repeating: 0, count: 4)
+        guard let ctx = CGContext(data: &rgba, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.draw(px, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        return NSColor(srgbRed: CGFloat(rgba[0]) / 255, green: CGFloat(rgba[1]) / 255, blue: CGFloat(rgba[2]) / 255, alpha: 1)
+    }
 
     // yazı aracı
     var editor: NSTextField?
@@ -3046,7 +3113,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         image.draw(in: fullRect)
         drawAll(includeCurrent: true)
 
-        if let c = current, c.tool == .pixelate || c.tool == .blur, let rr = rectOf(c) {
+        if let c = current, c.tool == .pixelate || c.tool == .blur || c.tool == .ocr, let rr = rectOf(c) {
             let p = NSBezierPath(rect: rr); p.lineWidth = 1.5 / scale
             p.setLineDash([6 / scale, 4 / scale], count: 2, phase: 0)
             NSColor.white.withAlphaComponent(0.9).setStroke(); p.stroke()
@@ -3195,7 +3262,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             ctx.addPath(cp)
             ctx.strokePath()
             ctx.restoreGState()
-        case .crop:
+        case .crop, .eyedropper, .ocr:
             break
         }
     }
@@ -3233,7 +3300,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         case .ruler:
             guard let last = m.points.last else { return false }
             return PathMath.segDist(p, first, last) <= max(m.width * 4, m.labelPx) + tol
-        case .eraser, .crop:
+        case .eraser, .crop, .eyedropper, .ocr:
             return false
         }
     }
@@ -3301,6 +3368,11 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         case .emoji:
             pushHistory()
             marks.append(Mark(tool: .emoji, color: .clear, width: (24 + lineWidth * 4) / scale, points: [p], text: emoji))
+        case .eyedropper:
+            if let c = pixelColor(at: p) {
+                color = c
+                onPickColor?(c)
+            }
         case .ruler:
             var m = Mark(tool: .ruler, color: color, width: max(lineWidth * 0.5, 1.5) / scale, points: [p])
             m.labelPx = 12 / scale
@@ -3343,6 +3415,24 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         if tool == .eraser && eraserMode == .whole { erasedThisDrag = false; return }
         guard let c = current else { return }
         current = nil
+        if c.tool == .ocr {
+            // seçilen alandaki metni tanı ve panoya kopyala (işaret eklenmez)
+            guard let rr = rectOf(c)?.intersection(fullRect), rr.width * scale > 6, rr.height * scale > 6,
+                  let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+            let sx = CGFloat(cg.width) / pixelSize.width, sy = CGFloat(cg.height) / pixelSize.height
+            let px = CGRect(x: rr.minX * sx, y: (pixelSize.height - rr.maxY) * sy, width: rr.width * sx, height: rr.height * sy).integral
+            guard let part = cg.cropping(to: px) else { return }
+            onStatus?("Metin okunuyor…")
+            OCR.recognize(part) { [weak self] text in
+                DispatchQueue.main.async {
+                    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if t.isEmpty { self?.onStatus?("Metin bulunamadı"); return }
+                    Output.copyText(t)
+                    self?.onStatus?("Metin kopyalandı ✓ (\(t.count) karakter)")
+                }
+            }
+            return
+        }
         switch c.tool {
         case .pen, .marker, .eraser:
             break
@@ -3490,6 +3580,8 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         ("😀", nil, "Emoji: tıklayınca emoji seç; resme tıklayarak yapıştır"),
         ("①", nil, "Numaralı işaret: her tık 1, 2, 3…"),
         ("Cetvel", "ruler", "Cetvel: iki nokta arasını sürükle, uzunluğu piksel olarak yazar"),
+        ("Renk", "eyedropper", "Renk seç: görselde bir yere tıkla; HEX kopyalanır ve kalem rengi olur"),
+        ("Metin", "text.viewfinder", "Metni kopyala: yazının olduğu alanı sürükleyerek seç"),
         ("▦", nil, "Pikselleştir: alanı sürükleyerek seç"),
         ("◌", nil, "Bulanıklaştır: alanı sürükleyerek seç"),
         ("Silgi", "eraser", "Silgi: tıklayınca bütün işaret / sadece dokunduğun yer seç"),
@@ -3520,6 +3612,15 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         canvas.onCommand = { [weak self] cmd in
             if cmd == "undo" { self?.undo() } else { self?.save() }
         }
+        canvas.onPickColor = { [weak self] c in
+            guard let self = self else { return }
+            let hex = String(format: "#%02X%02X%02X", Int((c.redComponent * 255).rounded()),
+                             Int((c.greenComponent * 255).rounded()), Int((c.blueComponent * 255).rounded()))
+            Output.copyText(hex)
+            self.highlightColor(-1)
+            self.status.stringValue = "\(hex) kopyalandı ✓ · kalem rengi oldu"
+        }
+        canvas.onStatus = { [weak self] t in self?.status.stringValue = t }
         canvas.onCropped = { [weak self] applied in
             // Enter / Esc sonrası son çizim aracına dön
             guard let self = self else { return }
@@ -3614,6 +3715,8 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         case .text: popUpMenu(fontMenu(), under: s, segment: s.selectedSegment)
         case .emoji: popUpMenu(emojiMenu(), under: s, segment: s.selectedSegment)
         case .ruler: status.stringValue = "Ölçmek istediğin iki nokta arasını sürükle"
+        case .eyedropper: status.stringValue = "Rengini almak istediğin yere tıkla"
+        case .ocr: status.stringValue = "Metnini kopyalamak istediğin alanı sürükle"
         case .eraser:
             status.stringValue = ""
             popUpMenu(eraserMenu(), under: s, segment: s.selectedSegment)
