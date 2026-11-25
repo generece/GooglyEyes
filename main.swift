@@ -902,10 +902,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Bildirim balonu
 
-    func toast(_ text: String, swatch: NSColor? = nil) {
+    func toast(_ text: String, swatch: NSColor? = nil, duration: Double = 1.8) {
         guard let button = statusItem.button, let win = button.window else { return }
         let anchor = win.convertToScreen(button.convert(button.bounds, to: nil))
-        Toast.show(text, below: anchor, swatch: swatch)
+        Toast.show(text, below: anchor, swatch: swatch, duration: duration)
     }
 
     // MARK: Ekran görüntüsü
@@ -1014,7 +1014,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let screen = NSScreen.screens.first { NSMouseInRect(mid, $0.frame, false) } ?? NSScreen.main
         if captureMode == .record {
             endCapture()
-            if let screen = screen { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.startRecording(r, on: screen) } }
+            if #available(macOS 13.0, *), let screen = screen {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.startRecording(r, on: screen) }
+            }
             return
         }
 
@@ -1941,7 +1943,7 @@ enum ImageTools {
         return CGImageSourceGetCount(src) > 0
     }
 
-    static func uniqueURL(next to url: URL, suffix: String, ext: String) -> URL {
+    static func uniqueURL(nextTo url: URL, suffix: String, ext: String) -> URL {
         let dir = url.deletingLastPathComponent()
         let base = url.deletingPathExtension().lastPathComponent + suffix
         var out = dir.appendingPathComponent(base).appendingPathExtension(ext)
@@ -2007,16 +2009,16 @@ enum ImageTools {
         switch job {
         case .png:
             if url.pathExtension.lowercased() == "png" { return "zaten PNG" }
-            let out = uniqueURL(next: url, suffix: "", ext: "png")
+            let out = uniqueURL(nextTo: url, suffix: "", ext: "png")
             return write(img, to: out, type: "public.png") ? out.lastPathComponent : nil
         case .compress:
             let before = fileSize(url)
             let out: URL
             if hasTransparency(img) {
-                out = uniqueURL(next: url, suffix: "_kucuk", ext: "png")       // saydamlık korunur
+                out = uniqueURL(nextTo: url, suffix: "_kucuk", ext: "png")       // saydamlık korunur
                 guard write(img, to: out, type: "public.png") else { return nil }
             } else {
-                out = uniqueURL(next: url, suffix: "_kucuk", ext: "jpg")
+                out = uniqueURL(nextTo: url, suffix: "_kucuk", ext: "jpg")
                 guard write(img, to: out, type: "public.jpeg", quality: 0.8) else { return nil }
             }
             let after = fileSize(out)
@@ -2028,7 +2030,7 @@ enum ImageTools {
         case .pot:
             let w = nearestPowerOfTwo(img.width), h = nearestPowerOfTwo(img.height)
             guard let r = resized(img, width: w, height: h) else { return nil }
-            let out = uniqueURL(next: url, suffix: "_\(w)x\(h)", ext: "png")
+            let out = uniqueURL(nextTo: url, suffix: "_\(w)x\(h)", ext: "png")
             return write(r, to: out, type: "public.png") ? "\(w)×\(h)" : nil
         }
     }
