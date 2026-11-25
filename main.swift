@@ -370,8 +370,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setUpdateMenu("Güncelleniyor…", enabled: false)
         Updater.install { [weak self] ok, log in
             DispatchQueue.main.async {
-                // başarılıysa kurulum scripti bu uygulamayı kapatıp yenisini açar; buraya sadece hata durumunda gelinir
-                guard let self = self, !ok else { return }
+                guard let self = self else { return }
+                if ok {
+                    // kurulum bitti ama bu (eski) kopya hâlâ açıksa: kendini kapat, yenisini aç
+                    let app = FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent("Applications/GooglyEyes.app").path
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: "/bin/sh")
+                    p.arguments = ["-c", "sleep 1; open \"$1\"", "relaunch", app]
+                    try? p.run()
+                    NSApp.terminate(nil)
+                    return
+                }
                 self.updating = false
                 self.setUpdateMenu("✨ Güncelleme Var: Yükle")
                 let needsTools = log.contains("Swift derleyicisi yok")

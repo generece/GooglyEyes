@@ -65,7 +65,8 @@ fi
 
 DEST="$HOME/Applications/GooglyEyes.app"
 mkdir -p "$HOME/Applications"
-pkill -x GooglyEyes 2>/dev/null || true
+# -a: güncelleme uygulamanın içinden başlatıldığında da onu kapat (pkill varsayılan olarak kendini başlatanları atlar)
+pkill -a -x GooglyEyes 2>/dev/null || true
 sleep 0.5
 rm -rf "$DEST"
 cp -R "$APP" "$DEST"
