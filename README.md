@@ -13,9 +13,10 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 - Şaşırma: ekran görüntüsü alırken ve panoya bir şey kopyalanınca göz bebekleri büyür
 - Çöp kutusu korkusu: mouse Dock'taki çöp kutusunun üstündeyken ya da Çöp Sepeti açıkken göz bebekleri küçülür ve titrer (Erişilebilirlik izni gerekir)
 
-**Ekran görüntüsü — ⌥⇧S**
+**Ekran görüntüsü — ⌥⇧S** (Ayarlar'dan değiştirilebilir)
 - Bölge seçimi; birden fazla ekranda çalışır
-- Görüntü panoya kopyalanır ve masaüstüne kaydedilir
+- Kısayola basıldığı an ekran dondurulur; açık menüler/açılır pencereler kapansa bile görüntü o anın hali olur
+- Menüden seçilir: sadece panoya ya da panoya + masaüstüne
 - Yakalama ScreenCaptureKit ile yapılır (macOS 14+)
 
 **WebP → PNG**
@@ -31,17 +32,31 @@ macOS menü çubuğunda duran, mouse'u takip eden googly gözler. Bölge ekran g
 
 ## Kurulum
 
-Gereken tek şey Xcode Command Line Tools (yoksa script kurulumu kendisi başlatır).
+Xcode gerekmez. Terminal'i aç ve şu satırı yapıştır:
 
 ```bash
-bash build.sh
+curl -fsSL https://raw.githubusercontent.com/generece/GooglyEyes/main/install.sh | bash
 ```
 
-Script uygulamayı derler, sabit bir yerel sertifikayla imzalar (böylece Ekran Kaydı izni her derlemede sıfırlanmaz), `~/Applications/GooglyEyes.app` olarak kurar ve başlatır.
+Script en son hazır sürümü indirir, `~/Applications/GooglyEyes.app` olarak kurar ve başlatır. Bu yolla kurunca macOS'un "açılamıyor" uyarısı çıkmaz.
 
-İlk ⌥⇧S'te **Ekran Kaydı** izni istenir: Sistem Ayarları → Gizlilik ve Güvenlik → Ekran ve Sistem Ses Kaydı'nda GooglyEyes'ı aç, sonra uygulamayı yeniden başlat.
+**Tarayıcıdan indirmek istersen:** [Releases](https://github.com/generece/GooglyEyes/releases/latest) sayfasından `GooglyEyes.zip`'i indir, aç, uygulamayı Uygulamalar klasörüne taşı. İlk açılışta macOS uyarı verirse uygulamaya **sağ tıkla → Aç** de (ya da Sistem Ayarları → Gizlilik ve Güvenlik → **Yine de Aç**). Bu sadece bir kez gerekir.
 
-> ⌥⇧S başka bir uygulamada ya da Kestirmeler (Shortcuts) uygulamasında tanımlıysa çakışır; önce onu kaldır.
+İlk ekran görüntüsünde **Ekran Kaydı** izni istenir: Sistem Ayarları → Gizlilik ve Güvenlik → Ekran ve Sistem Ses Kaydı'nda GooglyEyes'ı aç, sonra uygulamayı yeniden başlat.
+
+> Kısayollar başka bir uygulamada ya da Kestirmeler (Shortcuts) uygulamasında tanımlıysa çakışır; Ayarlar'dan değiştirebilirsin.
+
+## Ayarlar
+
+Gözlere tıkla → **Ayarlar…**: ekran görüntüsü kısayolu, kaydetme yeri (sadece pano / pano + masaüstü), işaretlemeyi otomatik açma, uyku süresi, rastgele davranışlar, WebP → PNG, girişte başlatma ve izinlerin durumu.
+
+## Güncelleme
+
+Gözlere tıkla → **Güncellemeleri Kontrol Et** (Ayarlar'da da var). Yeni sürüm varsa tek tıkla indirilir, kurulur ve uygulama yeniden açılır. Uygulama açılışta da bir kez bakar; yeni sürüm varsa menüde **✨ Güncelleme Var** yazar. Güncelleme asla kendiliğinden yapılmaz, sen onaylamadan hiçbir şey indirilmez.
+
+Her güncellemede `RELEASE_NOTES.md`'deki yenilikler, güncelleme penceresinde kullanıcıya gösterilir.
+
+Her `main` push'unda GitHub Actions uygulamayı Apple Silicon + Intel için derleyip yayınlar. Kaynak koddan kendin derlemek istersen (Xcode Command Line Tools gerekir): `bash build.sh`
 
 ## Gereksinimler
 

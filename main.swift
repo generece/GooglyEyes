@@ -7,6 +7,10 @@ import ScreenCaptureKit
 import ApplicationServices
 import CoreText
 import ImageIO
+import Vision
+import AVFoundation
+import CoreMedia
+import IOKit.ps
 
 // MARK: - Dokular
 
@@ -21,6 +25,14 @@ enum Tex {
     static let shine  = load("shine")
     static let lid    = load("lid")
     static let spiral = load("spiral")
+    // Accessories.png'den kesilen kostümler
+    static let pupils: [String: NSImage] = Dictionary(uniqueKeysWithValues:
+        ["pupil_blue", "pupil_green", "pupil_purple", "pupil_orange",
+         "pupil_heart", "pupil_star", "pupil_diamond", "pupil_sparkle"].map { ($0, load($0)) })
+    static let brows: [String: NSImage] = Dictionary(uniqueKeysWithValues:
+        ["arch", "angry", "worried", "happy"].flatMap { ["brow_\($0)_l", "brow_\($0)_r"] }.map { ($0, load($0)) })
+    static let glasses: [String: NSImage] = Dictionary(uniqueKeysWithValues:
+        ["glasses_black", "glasses_cat", "glasses_square", "glasses_gold"].map { ($0, load($0)) })
 }
 
 // MARK: - Ayarlar
@@ -35,6 +47,35 @@ enum Pref {
     static var randomBehaviors: Bool {
         get { d.object(forKey: "randomBehaviors") as? Bool ?? true }
         set { d.set(newValue, forKey: "randomBehaviors") }
+    }
+    /// 0: MP4, 1: GIF
+    static var recordFormat: Int {
+        get { d.integer(forKey: "recordFormat") }
+        set { d.set(newValue, forKey: "recordFormat") }
+    }
+    static var convertHeic: Bool {
+        get { d.bool(forKey: "convertHeic") }
+        set { d.set(newValue, forKey: "convertHeic") }
+    }
+    /// Costume.pupilNames sırasıyla
+    static var eyeColor: Int {
+        get { d.integer(forKey: "eyeColor") }
+        set { d.set(newValue, forKey: "eyeColor") }
+    }
+    /// 0 yok, 1 siyah yuvarlak, 2 kedi gözü, 3 kare, 4 altın
+    static var glasses: Int {
+        get { d.integer(forKey: "glassesStyle") }
+        set { d.set(newValue, forKey: "glassesStyle") }
+    }
+    /// Costume.browOptions sırasıyla
+    static var brows: Int {
+        get { d.integer(forKey: "brows") }
+        set { d.set(newValue, forKey: "brows") }
+    }
+    /// düşük pil / gece yarısı uykulu gözler
+    static var ambient: Bool {
+        get { d.object(forKey: "ambient") as? Bool ?? true }
+        set { d.set(newValue, forKey: "ambient") }
     }
     /// true: panoya + masaüstüne, false: sadece panoya
     static var saveToDesktop: Bool {
@@ -91,13 +132,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     let leftEye = Eye(), rightEye = Eye()
     var timer: Timer?
-    var hotKeyRef: EventHotKeyRef?
+    var hotKeyRefs: [HotkeyAction: EventHotKeyRef] = [:]
+    var captureMode: CaptureMode = .image
+    var colorSampler: NSColorSampler?
+    var tintColor: NSColor?
+    var tintUntil: CFTimeInterval = 0
+    var recording = false
+    var recordStart: CFTimeInterval = 0
+    var recorderBox: AnyObject?            // RegionRecorder (macOS 13+)
+    var recordBorder: NSWindow?
+    var recordStopTimer: Timer?
+    var recordControl: NSPanel?
+    var recordClock: Timer?
+    var droop: CGFloat = 0                 // ortama göre uykulu göz kapağı (0…1)
+    var droopTarget: CGFloat = 0
+    var lastAmbientCheck: CFTimeInterval = -100
     var globalClickMonitor: Any?
     var localClickMonitor: Any?
     var capturing = false
     var selectionWindows: [NSWindow] = []
     var frozen: [CGDirectDisplayID: CGImage] = [:]
     let webpWatcher = WebpWatcher()
+    var updateAvailable = false
+    var latestNotes = ""
+    var settings: SettingsWindowController?
+    var updating = false
 
     // çöp kutusu korkusu
     var fear: CGFloat = 0
@@ -107,6 +166,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var previousApp: NSRunningApplication?
     var annotationWindows: [AnnotationWindowController] = []
     var lastDrawKey = ""
+    var lastBusy: CFTimeInterval = 0
+    var currentFPS: Double = 0
 
     // görsel boyutlar (pt) — göz boyu menü çubuğu yüksekliğine göre ayarlanır
     var eyeSize: CGFloat = 22
@@ -117,6 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var maxR: CGFloat { (eyeSize - pupilSize) / 2 - 0.6 }
     var eyesWidth: CGFloat { pad * 2 + eyeSize * 2 + gap }
     var zzzWidth: CGFloat { barHeight * 1.0 }
+    var recDotWidth: CGFloat { barHeight * 0.6 }
 
     // davranış durumu
     var lastMouse = CGPoint.zero
@@ -142,10 +204,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: eyesWidth)
         statusItem.button?.imageScaling = .scaleNone
         statusItem.menu = buildMenu()
+        setupDropTarget()
         installEditMenu()
 
-        timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
-        RunLoop.main.add(timer!, forMode: .common)
+        setFrameRate(60)
 
         // Ekranın herhangi bir yerinde tık: sol → sol göz, sağ → sağ göz
         globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] e in
@@ -164,6 +226,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         registerHotKey()
         webpWatcher.onConverted = { [weak self] in self?.surprise(0.6) }
+        // açılıştan biraz sonra bir kez güncelleme var mı bak; sadece menüde haber verir, kendiliğinden kurmaz
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.checkForUpdates(manual: false) }
         if Pref.webpToPng { webpWatcher.start() }
         tick()
     }
@@ -194,27 +258,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func buildMenu() -> NSMenu {
         let m = NSMenu()
         m.delegate = self
-        let shot = NSMenuItem(title: "Bölge Ekran Görüntüsü Al", action: #selector(captureRegion), keyEquivalent: "s")
-        shot.keyEquivalentModifierMask = [.option, .shift]
-        shot.target = self
-        m.addItem(shot)
+        for (title, action, tag) in [("Bölge Ekran Görüntüsü Al", #selector(captureRegion), 47),
+                                     ("Renk Seç (HEX kopyala)", #selector(pickColor), 48),
+                                     ("Ekran Kaydı Başlat", #selector(toggleRecording), 50)] {
+            let i = item(title, action); i.tag = tag
+            m.addItem(i)
+        }
         m.addItem(item("Panodaki Görseli Aç ve İşaretle…", #selector(openAnnotatorFromClipboard)))
-        let auto = item("⌥⇧S Sonrası İşaretlemeyi Aç", #selector(toggleAutoAnnotate)); auto.tag = 43
-        m.addItem(auto)
-        let saveItem = NSMenuItem(title: "Ekran Görüntüsünü Kaydet", action: nil, keyEquivalent: "")
-        let saveMenu = NSMenu()
-        let onlyClip = item("Sadece Panoya", #selector(setSaveTarget(_:))); onlyClip.tag = 300
-        let both = item("Panoya + Masaüstüne", #selector(setSaveTarget(_:))); both.tag = 301
-        saveMenu.addItem(onlyClip); saveMenu.addItem(both)
-        saveItem.submenu = saveMenu
-        m.addItem(saveItem)
-        let webp = item("İndirilen WebP'leri PNG'ye Çevir", #selector(toggleWebp)); webp.tag = 45
-        webp.toolTip = "İndirilenler ve Masaüstü'ne gelen yeni .webp dosyalarını .png yapar; WebP'nin aslı Çöp Sepeti'ne gider"
-        m.addItem(webp)
         m.addItem(.separator())
 
-        let rnd = item("Rastgele Davranışlar", #selector(toggleRandom)); rnd.tag = 44
-        m.addItem(rnd)
         let tryItem = NSMenuItem(title: "Hareketleri Dene", action: nil, keyEquivalent: "")
         let tryMenu = NSMenu()
         for (title, tag) in [("Şaşır 😮", 3), ("Göz Devir 🙄", 4), ("Spiral Göz 🌀", 6),
@@ -224,23 +276,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         tryItem.submenu = tryMenu
         m.addItem(tryItem)
-        let sleepItem = NSMenuItem(title: "Uyku", action: nil, keyEquivalent: "")
-        let sleepMenu = NSMenu()
-        for (title, secs) in [("30 saniye sonra", 30.0), ("1 dakika sonra", 60.0), ("5 dakika sonra", 300.0), ("Kapalı", 0.0)] {
-            let i = item(title, #selector(setSleep(_:))); i.representedObject = secs; i.tag = 100
-            sleepMenu.addItem(i)
-        }
-        sleepMenu.addItem(.separator())
-        sleepMenu.addItem(item("Şimdi Uyu", #selector(sleepNow)))
-        sleepItem.submenu = sleepMenu
-        m.addItem(sleepItem)
         m.addItem(.separator())
 
-        m.addItem(item("Çöp Kutusu Korkusu için Erişilebilirlik İzni…", #selector(openAccessibility)))
-        let login = item("Girişte Başlat", #selector(toggleLogin(_:))); login.tag = 42
-        m.addItem(login)
-        m.addItem(item("Ekran Kaydı İzinlerini Aç…", #selector(openPrivacy)))
-        m.addItem(.separator())
+        let upd = item(updating ? "Güncelleniyor…" : (updateAvailable ? "✨ Güncelleme Var: Yükle" : "Güncellemeleri Kontrol Et"),
+                       #selector(checkForUpdatesManually)); upd.tag = 46
+        upd.isEnabled = !updating
+        m.addItem(upd)
+        let settingsItem = NSMenuItem(title: "Ayarlar…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        m.addItem(settingsItem)
+        m.addItem(item("GooglyEyes Hakkında", #selector(showAbout)))
         m.addItem(NSMenuItem(title: "Çıkış", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         return m
     }
@@ -252,23 +297,148 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        if let i = menu.item(withTag: 42) {
-            if #available(macOS 13.0, *) {
-                i.state = SMAppService.mainApp.status == .enabled ? .on : .off
-            } else { i.isHidden = true }
-        }
-        menu.item(withTag: 43)?.state = Pref.autoAnnotate ? .on : .off
-        menu.item(withTag: 44)?.state = Pref.randomBehaviors ? .on : .off
-        menu.item(withTag: 45)?.state = Pref.webpToPng ? .on : .off
-        menu.item(withTag: 300)?.state = Pref.saveToDesktop ? .off : .on
-        menu.item(withTag: 301)?.state = Pref.saveToDesktop ? .on : .off
-        for i in menu.items { if let sub = i.submenu { menuWillOpen(sub) } }
-        for i in menu.items where i.tag == 100 {
-            i.state = (i.representedObject as? Double) == Pref.sleepAfter ? .on : .off
+        for (tag, action) in [(47, HotkeyAction.capture), (48, .color), (49, .ocr), (50, .record)] {
+            guard let i = menu.item(withTag: tag) else { continue }
+            let hk = Hotkey.load(action)
+            i.keyEquivalent = hk.menuKey
+            i.keyEquivalentModifierMask = hk.cocoaMods
         }
     }
 
+    // MARK: Ayarlar
+
+    @objc func openSettings() {
+        if settings == nil { settings = SettingsWindowController(app: self) }
+        NSApp.activate(ignoringOtherApps: true)
+        settings?.refresh()
+        settings?.showWindow(nil)
+        settings?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    func setLogin(_ on: Bool) {
+        guard #available(macOS 13.0, *) else { return }
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch {
+            alert("Girişte başlatma ayarlanamadı", error.localizedDescription)
+        }
+    }
+
+    func setWebp(_ on: Bool) {
+        Pref.webpToPng = on
+        if on { webpWatcher.start() } else { webpWatcher.stop() }
+    }
+
+    /// Kısayol kutusu seçiliyken genel kısayolu geçici olarak kapat (yazarken ekran görüntüsü başlamasın)
+    func suspendHotKey() {
+        for (_, ref) in hotKeyRefs { UnregisterEventHotKey(ref) }
+        hotKeyRefs = [:]
+    }
+
     @objc func toggleAutoAnnotate() { Pref.autoAnnotate.toggle() }
+    // MARK: Hakkında
+
+    @objc func showAbout() {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        let commit = Updater.installedCommit
+        let build = commit == "unknown" ? "yerel derleme" : String(commit.prefix(7))
+
+        let center = NSMutableParagraphStyle(); center.alignment = .center
+        let small: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11),
+                                                     .foregroundColor: NSColor.secondaryLabelColor,
+                                                     .paragraphStyle: center]
+        let credits = NSMutableAttributedString()
+        credits.append(NSAttributedString(string: "Ece Gener tarafından yapıldı 👀\n\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.labelColor, .paragraphStyle: center]))
+        credits.append(NSAttributedString(string: "Menü çubuğunda mouse'u takip eden gözler,\nbölge ekran görüntüsü ve işaretleme.\n\n", attributes: small))
+        var link = small
+        link[.link] = URL(string: "https://github.com/\(Updater.repo)")!
+        credits.append(NSAttributedString(string: "github.com/\(Updater.repo)", attributes: link))
+
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "GooglyEyes",
+            .applicationVersion: version,
+            .version: build,
+            .credits: credits,
+        ])
+    }
+
+    // MARK: Güncelleme
+
+    func setUpdateMenu(_ title: String, enabled: Bool = true) {
+        if let i = statusItem.menu?.item(withTag: 46) {
+            i.title = title
+            i.isEnabled = enabled
+        }
+        settings?.refresh()
+    }
+
+    @objc func checkForUpdatesManually() {
+        if updateAvailable { confirmUpdate(); return }
+        checkForUpdates(manual: true)
+    }
+
+    func checkForUpdates(manual: Bool) {
+        if updating { return }
+        if manual { setUpdateMenu("Kontrol ediliyor…", enabled: false) }
+        Updater.latestRelease { [weak self] rel in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard let latest = rel?.commit else {
+                    self.setUpdateMenu("Güncellemeleri Kontrol Et")
+                    if manual { self.alert("Kontrol edilemedi", "GitHub'a ulaşılamadı. İnternet bağlantını kontrol edip tekrar dene.") }
+                    return
+                }
+                if !Updater.installedCommit.hasPrefix(latest) {
+                    self.updateAvailable = true
+                    self.latestNotes = rel?.notes ?? ""
+                    self.setUpdateMenu("✨ Güncelleme Var: Yükle")
+                    self.surprise(0.8)
+                    if manual { self.confirmUpdate() }
+                } else {
+                    self.updateAvailable = false
+                    self.setUpdateMenu("Güncellemeleri Kontrol Et")
+                    if manual { self.alert("Güncelsin ✓", "GooglyEyes'ın en son sürümünü kullanıyorsun.") }
+                }
+            }
+        }
+    }
+
+    func confirmUpdate() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Yeni sürüm hazır ✨"
+        let notes = latestNotes.count > 900 ? String(latestNotes.prefix(900)) + "…" : latestNotes
+        a.informativeText = (notes.isEmpty ? "" : "Yenilikler:\n\(notes)\n\n")
+            + "Güncelle'ye basınca GooglyEyes yeni sürümü kurup kendini yeniden başlatır (birkaç saniye)."
+        a.addButton(withTitle: "Güncelle")
+        a.addButton(withTitle: "Sonra")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        updating = true
+        setUpdateMenu("Güncelleniyor…", enabled: false)
+        Updater.install { [weak self] ok, log in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if ok {
+                    // kurulum bitti ama bu (eski) kopya hâlâ açıksa: kendini kapat, yenisini aç
+                    let app = FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent("Applications/GooglyEyes.app").path
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: "/bin/sh")
+                    p.arguments = ["-c", "sleep 1; open \"$1\"", "relaunch", app]
+                    try? p.run()
+                    NSApp.terminate(nil)
+                    return
+                }
+                self.updating = false
+                self.setUpdateMenu("✨ Güncelleme Var: Yükle")
+                self.alert("Güncelleme tamamlanamadı", "Ayrıntı:\n" + String(log.suffix(600)))
+            }
+        }
+    }
+
     @objc func setSaveTarget(_ sender: NSMenuItem) { Pref.saveToDesktop = sender.tag == 301 }
     @objc func toggleWebp() {
         Pref.webpToPng.toggle()
@@ -393,7 +563,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             eyeSize = size; barHeight = bh
             lastDrawKey = ""
         }
-        let wantLength = eyesWidth + (sleeping ? zzzWidth : 0)
+        let wantLength = eyesWidth + (sleeping ? zzzWidth : 0) + (recording ? recDotWidth : 0)
         if abs(statusItem.length - wantLength) > 0.1 { statusItem.length = wantLength; lastDrawKey = "" }
 
         // basılı tutulan tuşlar: sol → sol göz, sağ → sağ göz kapalı kalır
@@ -404,7 +574,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mouse = NSEvent.mouseLocation
 
         // çöp kutusu korkusu: Dock'taki çöp kutusunun üstündeyken ya da çöp kutusu penceresi açıkken
-        if now - lastTrashCheck > 0.4 {
+        if now - lastTrashCheck > 1.0 {
             lastTrashCheck = now
             trashOpen = TrashWatch.trashWindowOpen()
         }
@@ -423,6 +593,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         lastMouse = mouse
         if pressed != 0 { noteActivity(now) }
+
+        // ortama göre uykulu göz (düşük pil / gece yarısı); 30 sn'de bir bak
+        if now - lastAmbientCheck > 30 {
+            lastAmbientCheck = now
+            droopTarget = Pref.ambient ? Costume.ambientDroop() : 0
+        }
+        droop += (droopTarget - droop) * 0.05
+        if abs(droop - droopTarget) < 0.002 { droop = droopTarget }
 
         // uyku
         if !sleeping && Pref.sleepAfter > 0 && now - lastActivity > Pref.sleepAfter { goToSleep(now) }
@@ -489,22 +667,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var key = [leftEye, rightEye].map {
             String(format: "%.2f,%.2f,%d", $0.pos.x, $0.pos.y, $0.isClosed ? 1 : 0)
         }.joined(separator: "|") + String(format: "|%.3f|%d|%.3f", sAmt, sleeping ? 1 : 0, fear)
-        if sleeping { key += "|\(Int(now * 30))" }
+        if sleeping { key += "|\(Int(now * 12))" }
         if special == .spiral || fear > 0.01 { key += "|s\(Int(now * 60))" }
-        if key == lastDrawKey { return }
+        key += String(format: "|d%.3f|c%d|g%d|b%d", droop, Pref.eyeColor, Pref.glasses, Pref.brows)
+        if now < tintUntil { key += "|t\(Int(now * 10))" }
+        if recording { key += "|r\(Int(now * 3))" }
+        // Pil dostu: hareket yokken saniyede 10 kare, bir şey değişince hemen 60 kareye çık
+        let changed = key != lastDrawKey
+        if changed { lastBusy = now }
+        let idle = sleeping || now - lastBusy > 1.5
+        setFrameRate(idle ? (sleeping ? 12 : 10) : 60)
+        if !changed { return }
         lastDrawKey = key
         button.image = renderEyes(now: now, surprise: sAmt)
     }
 
+    /// Animasyon zamanlayıcısının hızını değiştir (aynıysa dokunma)
+    func setFrameRate(_ fps: Double) {
+        if fps == currentFPS, timer != nil { return }
+        currentFPS = fps
+        timer?.invalidate()
+        let t = Timer(timeInterval: 1.0 / fps, repeats: true) { [weak self] _ in self?.tick() }
+        t.tolerance = 0.2 / fps              // sistemin uyanmaları birleştirmesine izin ver
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
     func renderEyes(now: CFTimeInterval, surprise s: CGFloat) -> NSImage {
-        let w = eyesWidth + (sleeping ? zzzWidth : 0)
+        let w = eyesWidth + (sleeping ? zzzWidth : 0) + (recording ? recDotWidth : 0)
         let h = barHeight
         let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { [self] _ in
             for (i, eye) in [leftEye, rightEye].enumerated() {
                 let cx = pad + eyeSize / 2 + CGFloat(i) * (eyeSize + gap)
-                drawEye(eye, index: i, center: CGPoint(x: cx, y: h / 2), surprise: s, now: now)
+                drawEye(eye, index: i, center: CGPoint(x: cx, y: eyeCenterY(h)), surprise: s, now: now)
             }
+            drawAccessories(height: h)
             if sleeping { drawZzz(x0: eyesWidth - pad + 1, height: h, now: now) }
+            if recording {
+                // yanıp sönen kırmızı kayıt noktası
+                let on = Int(now * 1.5) % 2 == 0
+                let d = h * 0.38
+                let r = NSRect(x: w - recDotWidth / 2 - d / 2, y: h / 2 - d / 2, width: d, height: d)
+                NSColor.systemRed.withAlphaComponent(on ? 1 : 0.45).setFill()
+                NSBezierPath(ovalIn: r).fill()
+            }
             return true
         }
         img.isTemplate = false
@@ -512,7 +718,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func drawEye(_ eye: Eye, index: Int, center c: CGPoint, surprise s: CGFloat, now: CFTimeInterval) {
-        let es = eyeSize
+        let k = eyeScale
+        let es = eyeSize * k
         if sleeping || (eye.isClosed && s < 0.01) || (eye.held && !capturing) {
             // kapalıyken: göz akı açık kalır, üstünde siyah tire, en üstte kubbe parlaması
             let sRect = NSRect(x: c.x - es / 2, y: c.y - es / 2, width: es, height: es)
@@ -524,17 +731,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         // şaşırınca göz akı sabit kalır, göz bebeği beyazın neredeyse tamamını kaplayacak kadar büyür
-        var ps = pupilSize + (es * 0.88 - pupilSize) * s
+        var ps = pupilSize * k + (es * 0.88 - pupilSize * k) * s
         ps *= 1 - 0.55 * fear                      // korkunca göz bebeği küçülür
         let range = (es - ps) / 2 - 0.6
         let sRect = NSRect(x: c.x - es / 2, y: c.y - es / 2, width: es, height: es)
         Tex.sclera.draw(in: sRect)
         NSGraphicsContext.saveGraphicsState()
         NSBezierPath(ovalIn: sRect.insetBy(dx: 0.5, dy: 0.5)).addClip()
-        let k = maxR > 0 ? range / maxR : 1
+        let kp = maxR > 0 ? range / maxR : 1
         let jitter = fear * eyeSize * 0.05         // korkunca titrer
-        let p = CGPoint(x: c.x + eye.pos.x * k + CGFloat.random(in: -1...1) * jitter,
-                        y: c.y + eye.pos.y * k + CGFloat.random(in: -1...1) * jitter)
+        let p = CGPoint(x: c.x + eye.pos.x * kp + CGFloat.random(in: -1...1) * jitter,
+                        y: c.y + eye.pos.y * kp + CGFloat.random(in: -1...1) * jitter)
         if special == .spiral {
             // spiral göz bebeği: büyüyerek gelir, kendi merkezinde içe doğru akar gibi döner
             let st = now - specialStart
@@ -557,10 +764,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Tex.spiral.draw(in: NSRect(x: -size / 2, y: -size / 2, width: size, height: size))
             NSGraphicsContext.restoreGraphicsState()
         } else {
-            Tex.pupil.draw(in: NSRect(x: p.x - ps / 2, y: p.y - ps / 2, width: ps, height: ps))
+            let pr = NSRect(x: p.x - ps / 2, y: p.y - ps / 2, width: ps, height: ps)
+            if now < tintUntil, let tint = tintColor {
+                Costume.drawIris(tint, in: pr)                   // renk seçicide seçilen renk
+            } else if let tex = Costume.pupilTexture() {
+                tex.draw(in: pr)
+            } else {
+                Tex.pupil.draw(in: pr)
+            }
+        }
+        // ortama göre uykulu göz kapağı (şaşırınca açılır)
+        let lidAmount = droop * (1 - min(1, s * 1.5))
+        if lidAmount > 0.01 {
+            let lidH = es * lidAmount
+            let lid = NSRect(x: sRect.minX, y: sRect.maxY - lidH, width: es, height: lidH)
+            NSColor(white: 0.80, alpha: 1).setFill()
+            lid.fill()
+            let edge = NSBezierPath()
+            edge.move(to: NSPoint(x: sRect.minX, y: lid.minY))
+            edge.line(to: NSPoint(x: sRect.maxX, y: lid.minY))
+            edge.lineWidth = max(1.2, es * 0.08)
+            NSColor(white: 0.08, alpha: 1).setStroke()
+            edge.stroke()
         }
         NSGraphicsContext.restoreGraphicsState()
         Tex.shine.draw(in: sRect, from: .zero, operation: .sourceOver, fraction: 0.9)
+    }
+
+    var hasBrows: Bool { Costume.browOptions[min(max(Pref.brows, 0), Costume.browOptions.count - 1)].tex != nil }
+    /// Kaş varken gözler küçülüp aşağı iner ki kaşlar göz akının üstüne sığsın; gözlükte camlara sığsın
+    var eyeScale: CGFloat { hasBrows ? 0.7 : (Costume.hasGlasses ? 0.8 : 1) }
+    func eyeCenterY(_ h: CGFloat) -> CGFloat {
+        hasBrows ? h / 2 - eyeSize * (1 - eyeScale) / 2 : h / 2
+    }
+
+    /// Gözlük ve kaşlar (Ayarlar → Gözler)
+    func drawAccessories(height h: CGFloat) {
+        let es = eyeSize
+        let centers = (0..<2).map { CGPoint(x: pad + es / 2 + CGFloat($0) * (es + gap), y: eyeCenterY(h)) }
+        let g = Costume.glassesOptions[min(max(Pref.glasses, 0), Costume.glassesOptions.count - 1)]
+        if let name = g.tex, let tex = Tex.glasses[name], tex.size.height > 0 {
+            // gözlüğü çubuk yüksekliğine sığdır; sol yarıyı sol göze, sağ yarıyı sağ göze ortala
+            // kaş yokken çubuk yüksekliğinde; kaş varken küçülen gözlere göre
+            let gh = hasBrows ? es * eyeScale * 1.33 : h * 0.98, gw = gh * tex.size.width / tex.size.height
+            let mid = (centers[0].x + centers[1].x) / 2
+            for (i, lens) in [g.left, g.right].enumerated() {
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath(rect: i == 0 ? NSRect(x: 0, y: 0, width: mid, height: h)
+                                          : NSRect(x: mid, y: 0, width: 1000, height: h)).addClip()
+                tex.draw(in: NSRect(x: centers[i].x - lens * gw, y: centers[i].y - gh / 2, width: gw, height: gh))
+                NSGraphicsContext.restoreGraphicsState()
+            }
+        }
+        let browStyle = Costume.browOptions[min(max(Pref.brows, 0), Costume.browOptions.count - 1)].tex
+        if let style = browStyle {
+            let ees = es * eyeScale
+            for (i, c) in centers.enumerated() {
+                guard let tex = Tex.brows["brow_\(style)_\(i == 0 ? "l" : "r")"], tex.size.width > 0 else { continue }
+                let bw = ees * 1.0, bh = bw * tex.size.height / tex.size.width
+                // göz akının hemen üstünde, üst üste binmeden
+                let bottom = min(c.y + ees * 0.5 + 0.5, h - bh)
+                tex.draw(in: NSRect(x: c.x - bw / 2, y: bottom, width: bw, height: bh))
+            }
+        }
     }
 
     /// Küçükten büyüğe sırayla beliren, hafifçe salınan "z Z Z"
@@ -588,29 +854,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func blinkBoth() { leftEye.blink(); rightEye.blink() }
 
-    // MARK: Kısayol ⌥⇧S
+    // MARK: Kısayol (varsayılan ⌥⇧S, menüden değiştirilebilir)
 
     func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData -> OSStatus in
-            guard let userData = userData else { return noErr }
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, userData -> OSStatus in
+            guard let userData = userData, let event = event else { return noErr }
+            var hkID = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID)
             let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-            DispatchQueue.main.async { me.captureRegion() }
+            let id = Int(hkID.id)
+            DispatchQueue.main.async { me.hotKeyPressed(id) }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
-        let id = EventHotKeyID(signature: OSType(0x47457965), id: 1) // 'GEye'
-        let status = RegisterEventHotKey(UInt32(kVK_ANSI_S), UInt32(optionKey | shiftKey), id,
-                                         GetApplicationEventTarget(), 0, &hotKeyRef)
-        if status != noErr {
-            alert("⌥⇧S kısayolu kaydedilemedi", "Başka bir uygulama bu kısayolu kullanıyor olabilir. Menüden de ekran görüntüsü alabilirsin.")
+        let failed = HotkeyAction.allCases.filter { applyHotKey(Hotkey.load($0), for: $0) != noErr }
+        if !failed.isEmpty {
+            alert("Bazı kısayollar kaydedilemedi",
+                  failed.map { "\($0.title): \(Hotkey.load($0).display)" }.joined(separator: "\n")
+                  + "\n\nBaşka bir uygulama bunları kullanıyor olabilir. Ayarlar'dan başka kısayol seçebilirsin.")
         }
+    }
+
+    func hotKeyPressed(_ id: Int) {
+        switch HotkeyAction(rawValue: id) {
+        case .capture: captureRegion()
+        case .color: pickColor()
+        case .ocr: captureText()
+        case .record: toggleRecording()
+        case nil: break
+        }
+    }
+
+    /// Bir eylemin kısayolunu (yeniden) kaydet; başarılıysa noErr döner
+    @discardableResult
+    func applyHotKey(_ hk: Hotkey, for action: HotkeyAction = .capture) -> OSStatus {
+        if let ref = hotKeyRefs[action] { UnregisterEventHotKey(ref); hotKeyRefs[action] = nil }
+        var ref: EventHotKeyRef?
+        let id = EventHotKeyID(signature: OSType(0x47457965), id: UInt32(action.rawValue)) // 'GEye'
+        let st = RegisterEventHotKey(hk.keyCode, hk.carbonMods, id, GetApplicationEventTarget(), 0, &ref)
+        if st == noErr { hotKeyRefs[action] = ref }
+        return st
+    }
+
+    /// Bütün kısayolları kayıtlı ayarlarla yeniden aç
+    func restoreHotKeys() {
+        for a in HotkeyAction.allCases { applyHotKey(Hotkey.load(a), for: a) }
+    }
+
+    // MARK: Renk seçici
+
+    @objc func pickColor() {
+        if capturing || recording || colorSampler != nil { return }
+        sleeping = false
+        lastActivity = CACurrentMediaTime()
+        surprise(0.8)
+        let sampler = NSColorSampler()
+        colorSampler = sampler
+        sampler.show { [weak self] color in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.colorSampler = nil
+                guard let c = color?.usingColorSpace(.sRGB) else { return }   // Esc ile iptal
+                let hex = String(format: "#%02X%02X%02X",
+                                 Int((c.redComponent * 255).rounded()),
+                                 Int((c.greenComponent * 255).rounded()),
+                                 Int((c.blueComponent * 255).rounded()))
+                Output.copyText(hex)
+                self.lastChangeCount = NSPasteboard.general.changeCount
+                self.tintColor = c
+                self.tintUntil = CACurrentMediaTime() + 2.5      // göz bebekleri bir süre o renge bürünür
+                self.toast("\(hex) kopyalandı", swatch: c)
+            }
+        }
+    }
+
+    // MARK: Bildirim balonu
+
+    func toast(_ text: String, swatch: NSColor? = nil, duration: Double = 1.8) {
+        guard let button = statusItem.button, let win = button.window else { return }
+        let anchor = win.convertToScreen(button.convert(button.bounds, to: nil))
+        Toast.show(text, below: anchor, swatch: swatch, duration: duration)
     }
 
     // MARK: Ekran görüntüsü
 
     /// Kendi seçim ekranımız: seçim sürdüğü sürece `capturing` kesin olarak açık kalır
-    @objc func captureRegion() {
-        if capturing { return }
+    @objc func captureRegion() { startCapture(.image) }
+    @objc func captureText() { startCapture(.text) }
+
+    @objc func toggleRecording() {
+        if recording { stopRecording(); return }
+        guard #available(macOS 13.0, *) else {
+            alert("Ekran kaydı bu macOS sürümünde yok", "Ekran kaydı için macOS 13 (Ventura) ya da sonrası gerekiyor.")
+            return
+        }
+        startCapture(.record)
+    }
+
+    func startCapture(_ mode: CaptureMode) {
+        if capturing || recording || colorSampler != nil { return }
         // izin yoksa macOS kendi seçim arayüzünü açıp kafa karıştırıyor; önce izni kontrol et
         if #available(macOS 10.15, *), !CGPreflightScreenCaptureAccess() {
             CGRequestScreenCaptureAccess()
@@ -619,6 +962,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         capturing = true
+        captureMode = mode
         sleeping = false
         lastActivity = CACurrentMediaTime()
         surprise(1.0)
@@ -630,7 +974,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Ekranı HEMEN dondur: odağı almadan önce görüntüyü al. Böylece tarayıcıda açık olan
         // menü/sekme/açılır pencere odak değişince kapansa bile görüntü kısayola basılan anın hali olur.
         frozen = [:]
-        if #available(macOS 14.0, *) {
+        if mode != .record, #available(macOS 14.0, *) {          // kayıtta ekran canlı kalmalı
             Grabber.captureScreens(NSScreen.screens) { [weak self] images in
                 DispatchQueue.main.async {
                     guard let self = self, self.capturing else { return }
@@ -659,6 +1003,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             v.menuBarHeight = screen.frame.maxY - screen.visibleFrame.maxY
             if let cg = frozen[displayID(of: screen)] {
                 v.frozen = NSImage(cgImage: cg, size: screen.frame.size)
+            }
+            switch captureMode {
+            case .text: v.hint = "Metnini kopyalamak istediğin alanı seç"
+            case .record: v.hint = "Kaydedilecek alanı seç · durdurmak için gözlere tıkla ya da kısayola tekrar bas"
+            case .image: v.hint = nil
             }
             v.onDone = { [weak self] r in self?.endSelection(r) }
             w.contentView = v
@@ -692,6 +1041,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let r = rect else { endCapture(); return }
         let mid = NSPoint(x: r.midX, y: r.midY)
         let screen = NSScreen.screens.first { NSMouseInRect(mid, $0.frame, false) } ?? NSScreen.main
+        if captureMode == .record {
+            endCapture()
+            if #available(macOS 13.0, *), let screen = screen {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.startRecording(r, on: screen) }
+            }
+            return
+        }
 
         // donmuş görüntüden kes
         if let screen = screen, let full = shots[displayID(of: screen)] {
@@ -754,6 +1110,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func finishCapture(_ data: Data) {
         endCapture()
+        if captureMode == .text {
+            guard let cg = NSBitmapImageRep(data: data)?.cgImage else { return }
+            OCR.recognize(cg) { [weak self] text, err in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let err = err { self.toast("Metin okunamadı: \(err)", duration: 4); return }
+                    if t.isEmpty { self.toast("Metin bulunamadı"); return }
+                    Output.copyText(t)
+                    self.lastChangeCount = NSPasteboard.general.changeCount
+                    self.toast("Metin kopyalandı ✓ (\(t.count) karakter)")
+                }
+            }
+            return
+        }
         Output.toClipboard(png: data)
         lastChangeCount = NSPasteboard.general.changeCount
         if Pref.saveToDesktop, let err = Output.saveToDesktop(png: data, prefix: "Googly") {
@@ -767,7 +1138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openAnnotatorFromClipboard() {
         guard let img = NSImage(pasteboard: NSPasteboard.general), img.size.width > 0 else {
-            alert("Panoda görsel yok", "Önce ⌥⇧S ile bir ekran görüntüsü al ya da bir görsel kopyala.")
+            alert("Panoda görsel yok", "Önce \(Hotkey.load().display) ile bir ekran görüntüsü al ya da bir görsel kopyala.")
             return
         }
         openAnnotator(with: img)
@@ -849,6 +1220,1122 @@ enum TrashWatch {
     }
 }
 
+// MARK: - Kısayol
+
+/// Kısayolu olan eylemler (id, Carbon kısayol kimliği olarak da kullanılır)
+enum HotkeyAction: Int, CaseIterable {
+    case capture = 1, color, ocr, record
+
+    var title: String {
+        switch self {
+        case .capture: return "Ekran görüntüsü"
+        case .color: return "Renk seç"
+        case .ocr: return "Metni kopyala"
+        case .record: return "Ekran kaydı"
+        }
+    }
+
+    var defaultKey: Hotkey {
+        switch self {
+        case .capture: return Hotkey(keyCode: UInt32(kVK_ANSI_S), cocoaMods: [.option, .shift], keyName: "S")
+        case .color: return Hotkey(keyCode: UInt32(kVK_ANSI_C), cocoaMods: [.option, .shift], keyName: "C")
+        case .ocr: return Hotkey(keyCode: UInt32(kVK_ANSI_T), cocoaMods: [.option, .shift], keyName: "T")
+        case .record: return Hotkey(keyCode: UInt32(kVK_ANSI_R), cocoaMods: [.option, .shift], keyName: "R")
+        }
+    }
+
+    /// ilk kısayolun eski ayar adları korunur (kullanıcının seçimi kaybolmasın)
+    var prefSuffix: String { self == .capture ? "" : "\(rawValue)" }
+}
+
+struct Hotkey: Equatable {
+    var keyCode: UInt32
+    var cocoaMods: NSEvent.ModifierFlags
+    var keyName: String
+
+    static let defaultKey = HotkeyAction.capture.defaultKey
+
+    static func == (a: Hotkey, b: Hotkey) -> Bool { a.keyCode == b.keyCode && a.cocoaMods == b.cocoaMods }
+
+    static func load(_ action: HotkeyAction = .capture) -> Hotkey {
+        let d = UserDefaults.standard, x = action.prefSuffix
+        guard d.object(forKey: "hkCode" + x) != nil, let name = d.string(forKey: "hkName" + x) else { return action.defaultKey }
+        return Hotkey(keyCode: UInt32(d.integer(forKey: "hkCode" + x)),
+                      cocoaMods: NSEvent.ModifierFlags(rawValue: UInt(d.integer(forKey: "hkMods" + x))),
+                      keyName: name)
+    }
+
+    func save(_ action: HotkeyAction = .capture) {
+        let d = UserDefaults.standard, x = action.prefSuffix
+        d.set(Int(keyCode), forKey: "hkCode" + x)
+        d.set(Int(cocoaMods.rawValue), forKey: "hkMods" + x)
+        d.set(keyName, forKey: "hkName" + x)
+    }
+
+    var carbonMods: UInt32 {
+        var m = 0
+        if cocoaMods.contains(.command) { m |= cmdKey }
+        if cocoaMods.contains(.option) { m |= optionKey }
+        if cocoaMods.contains(.control) { m |= controlKey }
+        if cocoaMods.contains(.shift) { m |= shiftKey }
+        return UInt32(m)
+    }
+
+    var display: String {
+        var s = ""
+        if cocoaMods.contains(.control) { s += "⌃" }
+        if cocoaMods.contains(.option) { s += "⌥" }
+        if cocoaMods.contains(.shift) { s += "⇧" }
+        if cocoaMods.contains(.command) { s += "⌘" }
+        return s + keyName
+    }
+
+    /// Menüde gösterilecek tuş (tek karakterli tuşlar için)
+    var menuKey: String { keyName.count == 1 ? keyName.lowercased() : "" }
+
+    static let fKeys: [UInt16: String] = [122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6",
+                                          98: "F7", 100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12"]
+
+    static func name(for e: NSEvent) -> String? {
+        if let f = fKeys[e.keyCode] { return f }
+        switch e.keyCode {
+        case 49: return "Space"
+        case 36, 76: return "↩"
+        case 48: return "⇥"
+        case 51, 53: return nil          // sil ve Esc kullanılamaz
+        default: break
+        }
+        // tuşun kendisi (shift/option'ın değiştirdiği karakter değil)
+        guard let c = e.charactersIgnoringModifiers?.uppercased(), !c.isEmpty else { return nil }
+        return c
+    }
+}
+
+/// Basılan tuş kombinasyonunu yakalayan kutu
+final class HotkeyRecorder: NSView {
+    var hotkey = Hotkey.defaultKey { didSet { needsDisplay = true } }
+    var hint: String? { didSet { needsDisplay = true } }
+    var focused = false { didSet { needsDisplay = true } }
+    var onRecord: ((Hotkey) -> Void)?
+    var onFocus: ((Bool) -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+    override var canBecomeKeyView: Bool { false }      // pencere açılınca kendiliğinden seçilmesin; tıklayınca seçilir
+    override func becomeFirstResponder() -> Bool { focused = true; onFocus?(true); return true }
+    override func resignFirstResponder() -> Bool { focused = false; onFocus?(false); return true }
+    override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
+
+    override func draw(_ dirty: NSRect) {
+        let r = bounds.insetBy(dx: 1, dy: 4)
+        let p = NSBezierPath(roundedRect: r, xRadius: 7, yRadius: 7)
+        NSColor.controlBackgroundColor.setFill(); p.fill()
+        p.lineWidth = focused ? 2 : 1
+        (focused ? NSColor.controlAccentColor : NSColor.separatorColor).setStroke(); p.stroke()
+        let text = hint ?? hotkey.display
+        let s = NSAttributedString(string: text, attributes: [
+            .font: hint == nil ? NSFont.systemFont(ofSize: 17, weight: .semibold) : NSFont.systemFont(ofSize: 12),
+            .foregroundColor: hint == nil ? NSColor.labelColor : NSColor.systemRed])
+        let sz = s.size()
+        s.draw(at: NSPoint(x: r.midX - sz.width / 2, y: r.midY - sz.height / 2))
+    }
+
+    /// true: tuşu biz aldık
+    func record(_ e: NSEvent) -> Bool {
+        let mods = e.modifierFlags.intersection([.command, .option, .control, .shift])
+        // düz Enter / Esc / Tab pencerenin düğmelerine gitsin
+        if mods.isEmpty && [36, 76, 53, 48].contains(e.keyCode) { return false }
+        guard let name = Hotkey.name(for: e) else { return false }
+        let isF = Hotkey.fKeys[e.keyCode] != nil
+        if !isF && mods.intersection([.command, .option, .control]).isEmpty {
+            hint = "⌘, ⌥ ya da ⌃ ile birlikte bas"
+            return true
+        }
+        hint = nil
+        hotkey = Hotkey(keyCode: UInt32(e.keyCode), cocoaMods: mods, keyName: name)
+        onRecord?(hotkey)
+        return true
+    }
+
+    override func keyDown(with e: NSEvent) { if !record(e) { super.keyDown(with: e) } }
+    override func performKeyEquivalent(with e: NSEvent) -> Bool {
+        guard window?.firstResponder === self, e.type == .keyDown else { return false }
+        return record(e)
+    }
+}
+
+// MARK: - Ayarlar penceresi
+
+final class SettingsWindowController: NSWindowController, NSWindowDelegate {
+    weak var app: AppDelegate?
+
+    var recorders: [HotkeyAction: HotkeyRecorder] = [:]
+    var hotkeyNotes: [HotkeyAction: NSTextField] = [:]
+    let savePopup = NSPopUpButton()
+    let recordPopup = NSPopUpButton()
+    let annotateCheck = NSButton(checkboxWithTitle: "Çektikten sonra işaretleme penceresini aç", target: nil, action: nil)
+    let sleepPopup = NSPopUpButton()
+    let randomCheck = NSButton(checkboxWithTitle: "Rastgele davranışlar (göz devirme, spiral göz…)", target: nil, action: nil)
+    let eyeColorPopup = NSPopUpButton()
+    let glassesPopup = NSPopUpButton()
+    let browsPopup = NSPopUpButton()
+    let ambientCheck = NSButton(checkboxWithTitle: "Ortama göre tepki (pil azalınca ve gece yarısından sonra uykulu)", target: nil, action: nil)
+    let webpCheck = NSButton(checkboxWithTitle: "İndirilen WebP ve AVIF görselleri otomatik PNG'ye çevir", target: nil, action: nil)
+    let heicCheck = NSButton(checkboxWithTitle: "HEIC'leri de çevir (iPhone fotoğrafları)", target: nil, action: nil)
+    let loginCheck = NSButton(checkboxWithTitle: "Mac açılınca GooglyEyes'ı başlat", target: nil, action: nil)
+    let screenStatus = NSTextField(labelWithString: "")
+    let screenButton = NSButton(title: "İzin Ver…", target: nil, action: nil)
+    let axStatus = NSTextField(labelWithString: "")
+    let axButton = NSButton(title: "İzin Ver…", target: nil, action: nil)
+    let resetPermsButton = NSButton(title: "İzinleri Sıfırla…", target: nil, action: nil)
+    let versionLabel = NSTextField(labelWithString: "")
+    let updateButton = NSButton(title: "Güncellemeleri Kontrol Et", target: nil, action: nil)
+
+    static let sleepOptions: [(String, Double)] = [("30 saniye sonra", 30), ("1 dakika sonra", 60), ("5 dakika sonra", 300), ("Kapalı", 0)]
+
+    init(app: AppDelegate) {
+        self.app = app
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 700),
+                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        win.title = "GooglyEyes Ayarlar"
+        win.isReleasedWhenClosed = false
+        super.init(window: win)
+        win.delegate = self
+        build()
+        win.center()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    // MARK: Kurulum
+
+    func label(_ t: String) -> NSTextField {
+        let l = NSTextField(labelWithString: t)
+        l.alignment = .right
+        return l
+    }
+
+    func section(_ t: String) -> NSTextField {
+        let l = NSTextField(labelWithString: t)
+        l.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        return l
+    }
+
+    func note(_ t: String) -> NSTextField {
+        let l = NSTextField(wrappingLabelWithString: t)
+        l.font = NSFont.systemFont(ofSize: 11)
+        l.textColor = .secondaryLabelColor
+        l.preferredMaxLayoutWidth = 420
+        return l
+    }
+
+    func row(_ views: [NSView]) -> NSStackView {
+        let s = NSStackView(views: views)
+        s.spacing = 8
+        s.alignment = .centerY
+        return s
+    }
+
+    func hotkeyRow(_ action: HotkeyAction) -> NSStackView {
+        let rec = HotkeyRecorder(frame: NSRect(x: 0, y: 0, width: 130, height: 32))
+        rec.translatesAutoresizingMaskIntoConstraints = false
+        rec.widthAnchor.constraint(equalToConstant: 130).isActive = true
+        rec.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        let n = NSTextField(labelWithString: "")
+        n.font = NSFont.systemFont(ofSize: 11)
+        rec.onFocus = { [weak self] focused in
+            guard let app = self?.app else { return }
+            if focused {
+                app.suspendHotKey()                     // yazarken kısayollar tetiklenmesin
+                n.stringValue = "Yeni kısayola bas…"
+                n.textColor = .secondaryLabelColor
+            } else {
+                app.restoreHotKeys()
+                if n.textColor != .systemRed { n.stringValue = "" }
+            }
+        }
+        rec.onRecord = { [weak self] hk in self?.tryHotKey(hk, for: action) }
+        let reset = NSButton(title: "Varsayılan", target: self, action: #selector(resetHotKey(_:)))
+        reset.controlSize = .small
+        reset.tag = action.rawValue
+        recorders[action] = rec
+        hotkeyNotes[action] = n
+        return row([rec, reset, n])
+    }
+
+    func build() {
+        guard let content = window?.contentView else { return }
+
+        savePopup.addItems(withTitles: ["Sadece panoya", "Panoya + masaüstüne"])
+        savePopup.target = self; savePopup.action = #selector(saveChanged)
+        recordPopup.addItems(withTitles: ["MP4 video", "GIF"])
+        recordPopup.target = self; recordPopup.action = #selector(recordFormatChanged)
+        annotateCheck.target = self; annotateCheck.action = #selector(annotateChanged)
+
+        sleepPopup.addItems(withTitles: Self.sleepOptions.map { $0.0 })
+        sleepPopup.target = self; sleepPopup.action = #selector(sleepChanged)
+        randomCheck.target = self; randomCheck.action = #selector(randomChanged)
+        eyeColorPopup.addItems(withTitles: Costume.pupilNames)
+        glassesPopup.addItems(withTitles: Costume.glassesNames)
+        eyeColorPopup.target = self; eyeColorPopup.action = #selector(costumeChanged)
+        browsPopup.addItems(withTitles: Costume.browNames)
+        browsPopup.target = self; browsPopup.action = #selector(costumeChanged)
+        glassesPopup.target = self; glassesPopup.action = #selector(costumeChanged)
+        ambientCheck.target = self; ambientCheck.action = #selector(ambientChanged)
+
+        webpCheck.target = self; webpCheck.action = #selector(webpChanged)
+        heicCheck.target = self; heicCheck.action = #selector(heicChanged)
+        loginCheck.target = self; loginCheck.action = #selector(loginChanged)
+        screenButton.target = self; screenButton.action = #selector(askScreen)
+        axButton.target = self; axButton.action = #selector(askAX)
+        resetPermsButton.target = self; resetPermsButton.action = #selector(resetPermissions)
+        resetPermsButton.controlSize = .small
+        for b in [screenButton, axButton] { b.controlSize = .small }
+        updateButton.target = self; updateButton.action = #selector(checkUpdates)
+
+        let e = NSGridCell.emptyContentView
+        var rows: [[NSView]] = [[section("Kısayollar"), e]]
+        for a in HotkeyAction.allCases { rows.append([label(a.title + ":"), hotkeyRow(a)]) }
+        rows += [
+            [section("Ekran Görüntüsü ve Kayıt"), e],
+            [label("Kaydet:"), savePopup],
+            [e, annotateCheck],
+            [label("Kayıt biçimi:"), recordPopup],
+            [e, note("Kayıtlar masaüstüne kaydedilir ve panoya kopyalanır. En fazla 1 dakika; durdurmak için gözlere tıkla ya da kısayola tekrar bas.")],
+            [section("Gözler"), e],
+            [label("Göz bebeği:"), eyeColorPopup],
+            [label("Gözlük:"), glassesPopup],
+            [label("Kaşlar:"), browsPopup],
+            [label("Uyku:"), sleepPopup],
+            [e, randomCheck],
+            [e, ambientCheck],
+            [section("Dosyalar"), e],
+            [e, webpCheck],
+            [e, heicCheck],
+            [e, note("Çevrilen dosyanın aslı Çöp Sepeti'ne gider. Görselleri gözlerin üstüne sürükleyip bırakarak PNG'ye çevirebilir, sıkıştırabilir ya da 2'nin kuvvetine boyutlandırabilirsin.")],
+            [section("Genel"), e],
+            [e, loginCheck],
+            [label("Ekran Kaydı:"), row([screenStatus, screenButton])],
+            [label("Erişilebilirlik:"), row([axStatus, axButton])],
+            [e, note("İzin verdikten sonra GooglyEyes'ı kapatıp yeniden aç. Sistem Ayarları'nda açık görünüp burada \"Verilmedi\" yazıyorsa İzinleri Sıfırla'ya bas.")],
+            [e, resetPermsButton],
+            [section("Güncelleme"), e],
+            [label("Sürüm:"), row([versionLabel, updateButton])],
+        ]
+        let grid = NSGridView(views: rows)
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.rowSpacing = 8
+        grid.columnSpacing = 10
+        grid.column(at: 0).xPlacement = .trailing
+        grid.rowAlignment = .firstBaseline
+        // bölüm başlıkları: ikinci sütunu boş olan satırlar
+        for (i, r) in rows.enumerated() where r[0] !== e && r[1] === e {
+            let gr = grid.row(at: i)
+            gr.mergeCells(in: NSRange(location: 0, length: 2))
+            gr.cell(at: 0).xPlacement = .leading
+            if i > 0 { gr.topPadding = 10 }
+        }
+        content.addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
+            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            grid.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -24),
+            grid.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -18),
+        ])
+        if #unavailable(macOS 13.0) { loginCheck.isHidden = true }
+    }
+
+    // MARK: Değerleri göster
+
+    func refresh() {
+        guard let app = app else { return }
+        for (a, rec) in recorders where !rec.focused { rec.hotkey = Hotkey.load(a) }
+        savePopup.selectItem(at: Pref.saveToDesktop ? 1 : 0)
+        recordPopup.selectItem(at: Pref.recordFormat == 1 ? 1 : 0)
+        annotateCheck.state = Pref.autoAnnotate ? .on : .off
+        sleepPopup.selectItem(at: Self.sleepOptions.firstIndex { $0.1 == Pref.sleepAfter } ?? 1)
+        randomCheck.state = Pref.randomBehaviors ? .on : .off
+        eyeColorPopup.selectItem(at: min(max(Pref.eyeColor, 0), Costume.pupilOptions.count - 1))
+        glassesPopup.selectItem(at: min(max(Pref.glasses, 0), Costume.glassesOptions.count - 1))
+        browsPopup.selectItem(at: min(max(Pref.brows, 0), Costume.browNames.count - 1))
+        ambientCheck.state = Pref.ambient ? .on : .off
+        webpCheck.state = Pref.webpToPng ? .on : .off
+        heicCheck.state = Pref.convertHeic ? .on : .off
+        heicCheck.isEnabled = Pref.webpToPng
+        if #available(macOS 13.0, *) { loginCheck.state = SMAppService.mainApp.status == .enabled ? .on : .off }
+
+        let screenOK = CGPreflightScreenCaptureAccess(), axOK = AXIsProcessTrusted()
+        screenStatus.stringValue = screenOK ? "Verildi ✓" : "Verilmedi"
+        screenStatus.textColor = screenOK ? .systemGreen : .secondaryLabelColor
+        screenButton.isHidden = screenOK
+        axStatus.stringValue = axOK ? "Verildi ✓" : "Verilmedi"
+        axStatus.textColor = axOK ? .systemGreen : .secondaryLabelColor
+        axButton.isHidden = axOK
+
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        let commit = Updater.installedCommit
+        versionLabel.stringValue = "\(version) (\(commit == "unknown" ? "yerel derleme" : String(commit.prefix(7))))"
+        if app.updating {
+            updateButton.title = "Güncelleniyor…"; updateButton.isEnabled = false
+        } else if app.updateAvailable {
+            updateButton.title = "✨ Güncellemeyi Yükle"; updateButton.isEnabled = true
+        } else {
+            updateButton.title = "Güncellemeleri Kontrol Et"; updateButton.isEnabled = true
+        }
+    }
+
+    func windowDidBecomeKey(_ n: Notification) { refresh() }   // izin ekranından dönünce durumu tazele
+
+    // MARK: Eylemler
+
+    func tryHotKey(_ hk: Hotkey, for action: HotkeyAction) {
+        guard let app = app else { return }
+        let n = hotkeyNotes[action]
+        // aynı kısayol başka bir GooglyEyes eylemindeyse
+        if let other = HotkeyAction.allCases.first(where: { $0 != action && Hotkey.load($0) == hk }) {
+            recorders[action]?.hotkey = Hotkey.load(action)
+            n?.stringValue = "\(hk.display) zaten \"\(other.title)\" için kullanılıyor"
+            n?.textColor = .systemRed
+            return
+        }
+        // gerçekten kaydedilebiliyor mu dene (başka uygulama kullanıyor olabilir)
+        if app.applyHotKey(hk, for: action) == noErr {
+            hk.save(action)
+            n?.stringValue = "Kaydedildi ✓"
+            n?.textColor = .systemGreen
+        } else {
+            recorders[action]?.hotkey = Hotkey.load(action)
+            n?.stringValue = "\(hk.display) başka bir uygulamada kullanılıyor"
+            n?.textColor = .systemRed
+        }
+        if recorders.values.contains(where: { $0.focused }) { app.suspendHotKey() } else { app.restoreHotKeys() }
+    }
+
+    @objc func resetHotKey(_ sender: NSButton) {
+        guard let action = HotkeyAction(rawValue: sender.tag) else { return }
+        window?.makeFirstResponder(nil)
+        tryHotKey(action.defaultKey, for: action)
+        recorders[action]?.hotkey = Hotkey.load(action)
+    }
+
+    @objc func saveChanged() { Pref.saveToDesktop = savePopup.indexOfSelectedItem == 1 }
+    @objc func recordFormatChanged() { Pref.recordFormat = recordPopup.indexOfSelectedItem }
+    @objc func annotateChanged() { Pref.autoAnnotate = annotateCheck.state == .on }
+    @objc func sleepChanged() {
+        Pref.sleepAfter = Self.sleepOptions[sleepPopup.indexOfSelectedItem].1
+        app?.lastActivity = CACurrentMediaTime()
+    }
+    @objc func randomChanged() { Pref.randomBehaviors = randomCheck.state == .on }
+    @objc func costumeChanged() {
+        Pref.eyeColor = eyeColorPopup.indexOfSelectedItem
+        Pref.brows = browsPopup.indexOfSelectedItem
+        Pref.glasses = glassesPopup.indexOfSelectedItem
+    }
+    @objc func ambientChanged() {
+        Pref.ambient = ambientCheck.state == .on
+        app?.lastAmbientCheck = -100                  // hemen yeniden hesapla
+    }
+    @objc func webpChanged() { app?.setWebp(webpCheck.state == .on); refresh() }
+    @objc func heicChanged() { Pref.convertHeic = heicCheck.state == .on }
+    @objc func loginChanged() { app?.setLogin(loginCheck.state == .on); refresh() }
+    @objc func askScreen() { _ = CGRequestScreenCaptureAccess(); app?.openPrivacy() }
+    @objc func askAX() { app?.openAccessibility() }
+
+    /// Ayarlarda "verilmiş" görünüp çalışmayan (eski imzaya ait) izin kayıtlarını temizler
+    @objc func resetPermissions() {
+        let a = NSAlert()
+        a.messageText = "İzinler sıfırlansın mı?"
+        a.informativeText = "Sistem Ayarları'nda açık görünüp GooglyEyes'ta \"Verilmedi\" yazıyorsa izin kaydı eskimiştir. Sıfırladıktan sonra açılan pencerelerden izinleri yeniden ver ve GooglyEyes'ı yeniden başlat."
+        a.addButton(withTitle: "Sıfırla")
+        a.addButton(withTitle: "Vazgeç")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let id = Bundle.main.bundleIdentifier ?? "com.ecegener.googlyeyes"
+        for service in ["Accessibility", "ScreenCapture"] {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            p.arguments = ["reset", service, id]
+            try? p.run()
+            p.waitUntilExit()
+        }
+        _ = CGRequestScreenCaptureAccess()
+        app?.openAccessibility()
+        refresh()
+    }
+    @objc func checkUpdates() { app?.checkForUpdatesManually() }
+
+    func windowWillClose(_ n: Notification) {
+        window?.makeFirstResponder(nil)          // kutu seçiliyse kısayolları geri aç
+        app?.restoreHotKeys()
+    }
+}
+
+// MARK: - Yakalama modları
+
+enum CaptureMode { case image, text, record }
+
+// MARK: - Bildirim balonu
+
+/// Gözlerin altında kısa süre görünen küçük bildirim
+enum Toast {
+    static var panel: NSPanel?
+    static var hideWork: DispatchWorkItem?
+
+    static func show(_ text: String, below anchor: NSRect, swatch: NSColor? = nil, duration: Double = 1.8) {
+        hideWork?.cancel()
+        panel?.orderOut(nil)
+
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        label.textColor = .white
+        let sw: CGFloat = swatch == nil ? 0 : 18
+        let size = label.intrinsicContentSize
+        let w = size.width + 28 + (sw > 0 ? sw + 8 : 0), h = max(size.height, sw) + 16
+        let screen = NSScreen.screens.first { NSMouseInRect(NSPoint(x: anchor.midX, y: anchor.midY), $0.frame, false) } ?? NSScreen.main
+        var x = anchor.midX - w / 2
+        if let f = screen?.visibleFrame { x = min(max(x, f.minX + 8), f.maxX - w - 8) }
+        let frame = NSRect(x: x, y: anchor.minY - h - 6, width: w, height: h)
+
+        let p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
+        p.ignoresMouseEvents = true
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+        let bg = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        bg.wantsLayer = true
+        bg.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.82).cgColor
+        bg.layer?.cornerRadius = h / 2
+        var lx: CGFloat = 14
+        if let c = swatch {
+            let dot = NSView(frame: NSRect(x: 12, y: (h - sw) / 2, width: sw, height: sw))
+            dot.wantsLayer = true
+            dot.layer?.backgroundColor = c.cgColor
+            dot.layer?.cornerRadius = sw / 2
+            dot.layer?.borderColor = NSColor.white.withAlphaComponent(0.7).cgColor
+            dot.layer?.borderWidth = 1
+            bg.addSubview(dot)
+            lx += sw + 6
+        }
+        label.frame = NSRect(x: lx, y: (h - size.height) / 2, width: size.width + 4, height: size.height)
+        bg.addSubview(label)
+        p.contentView = bg
+        p.alphaValue = 0
+        p.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in ctx.duration = 0.15; p.animator().alphaValue = 1 }
+        panel = p
+
+        let work = DispatchWorkItem {
+            NSAnimationContext.runAnimationGroup({ ctx in ctx.duration = 0.3; p.animator().alphaValue = 0 },
+                                                 completionHandler: { p.orderOut(nil); if panel === p { panel = nil } })
+        }
+        hideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+}
+
+// MARK: - Metin tanıma (OCR)
+
+enum OCR {
+    /// Görseli Vision'ın sorunsuz okuyacağı biçime getir: 8-bit sRGB, beyaz zemin, küçükse büyütülmüş
+    static func normalized(_ cg: CGImage) -> CGImage? {
+        let shortSide = CGFloat(min(cg.width, cg.height))
+        let k = min(3, max(1, 160 / max(shortSide, 1)))           // çok küçük alanlarda yazıyı büyüt
+        let w = Int(CGFloat(cg.width) * k), h = Int(CGFloat(cg.height) * k)
+        guard w > 0, h > 0,
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.interpolationQuality = .high
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+
+    /// completion: (bulunan metin, hata mesajı)
+    static func recognize(_ cg: CGImage, completion: @escaping (String, String?) -> Void) {
+        guard let img = normalized(cg) else { completion("", "Görsel hazırlanamadı"); return }
+        let req = VNRecognizeTextRequest { r, err in
+            if let err = err { completion("", err.localizedDescription); return }
+            let lines = (r.results as? [VNRecognizedTextObservation])?
+                .compactMap { $0.topCandidates(1).first?.string } ?? []
+            completion(lines.joined(separator: "\n"), nil)
+        }
+        req.recognitionLevel = .accurate
+        req.usesLanguageCorrection = true
+        let supported = (try? req.supportedRecognitionLanguages()) ?? []
+        let wanted = ["tr-TR", "en-US"].filter { supported.contains($0) }
+        if !wanted.isEmpty {
+            req.recognitionLanguages = wanted
+        } else if #available(macOS 13.0, *) {
+            req.automaticallyDetectsLanguage = true
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { try VNImageRequestHandler(cgImage: img, options: [:]).perform([req]) }
+            catch { completion("", error.localizedDescription) }
+        }
+    }
+}
+
+// MARK: - Bölge ekran kaydı
+
+@available(macOS 13.0, *)
+final class RegionRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
+    private var stream: SCStream?
+    private var writer: AVAssetWriter?
+    private var input: AVAssetWriterInput?
+    private var started = false
+    private let queue = DispatchQueue(label: "googly.record")
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("googly-\(UUID().uuidString).mp4")
+    var onError: ((String) -> Void)?
+
+    /// rect: genel ekran koordinatları (Cocoa, sol-alt orijin)
+    func start(rect r: NSRect, on screen: NSScreen, completion: @escaping (String?) -> Void) {
+        let id = displayID(of: screen)
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, error in
+            guard let self = self else { return }
+            guard let content = content, let display = content.displays.first(where: { $0.displayID == id }) else {
+                completion(error?.localizedDescription ?? "Ekran bulunamadı"); return
+            }
+            // kendi pencerelerimizi (kayıt çerçevesi, gözler) kayda katma
+            let me = content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
+            let filter = SCContentFilter(display: display, excludingApplications: me, exceptingWindows: [])
+            let f = screen.frame
+            let clipped = r.intersection(f)
+            let scale = screen.backingScaleFactor
+            let w = max(2, Int(clipped.width * scale) & ~1), h = max(2, Int(clipped.height * scale) & ~1)
+            let cfg = SCStreamConfiguration()
+            cfg.sourceRect = CGRect(x: clipped.minX - f.minX, y: f.maxY - clipped.maxY,
+                                    width: clipped.width, height: clipped.height)
+            cfg.width = w
+            cfg.height = h
+            cfg.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+            cfg.showsCursor = true
+            cfg.pixelFormat = kCVPixelFormatType_32BGRA
+            cfg.queueDepth = 6
+
+            do {
+                let wr = try AVAssetWriter(outputURL: self.url, fileType: .mp4)
+                let inp = AVAssetWriterInput(mediaType: .video, outputSettings: [
+                    AVVideoCodecKey: AVVideoCodecType.h264,
+                    AVVideoWidthKey: w,
+                    AVVideoHeightKey: h,
+                ])
+                inp.expectsMediaDataInRealTime = true
+                wr.add(inp)
+                self.writer = wr
+                self.input = inp
+                let st = SCStream(filter: filter, configuration: cfg, delegate: self)
+                try st.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
+                self.stream = st
+                st.startCapture { err in completion(err?.localizedDescription) }
+            } catch {
+                completion(error.localizedDescription)
+            }
+        }
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sb.isValid,
+              let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let raw = atts.first?[.status] as? Int, let status = SCFrameStatus(rawValue: raw), status == .complete,
+              let writer = writer, let input = input else { return }
+        if !started {
+            guard writer.startWriting() else { return }
+            writer.startSession(atSourceTime: sb.presentationTimeStamp)
+            started = true
+        }
+        if input.isReadyForMoreMediaData { input.append(sb) }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { self.onError?(error.localizedDescription) }
+    }
+
+    func stop(_ completion: @escaping (URL?) -> Void) {
+        guard let st = stream else { completion(nil); return }
+        stream = nil
+        st.stopCapture { [weak self] _ in
+            guard let self = self else { return }
+            self.queue.async {
+                guard self.started, let writer = self.writer else {
+                    self.writer?.cancelWriting(); completion(nil); return
+                }
+                self.input?.markAsFinished()
+                writer.finishWriting { completion(writer.status == .completed ? self.url : nil) }
+            }
+        }
+    }
+}
+
+enum GIFMaker {
+    /// MP4'ü GIF'e çevirir (en fazla 720 px genişlik, 12 kare/sn)
+    static func convert(_ mp4: URL, to gif: URL, fps: Double = 12, maxWidth: CGFloat = 720) -> Bool {
+        let asset = AVURLAsset(url: mp4)
+        let duration = CMTimeGetSeconds(asset.duration)
+        guard duration > 0 else { return false }
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .zero
+        gen.maximumSize = CGSize(width: maxWidth, height: maxWidth * 4)
+        let count = max(1, Int(duration * fps))
+        guard let dest = CGImageDestinationCreateWithURL(gif as CFURL, "com.compuserve.gif" as CFString, count, nil) else { return false }
+        CGImageDestinationSetProperties(dest, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+        let frameProps = [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: 1.0 / fps]] as CFDictionary
+        for i in 0..<count {
+            let t = CMTime(seconds: Double(i) / fps, preferredTimescale: 600)
+            if let img = try? gen.copyCGImage(at: t, actualTime: nil) {
+                CGImageDestinationAddImage(dest, img, frameProps)
+            }
+        }
+        return CGImageDestinationFinalize(dest)
+    }
+}
+
+/// Kaydedilen alanın etrafındaki kırmızı çerçeve (kayda girmez, tıklamaları engellemez)
+final class RecordBorderView: NSView {
+    override func draw(_ dirty: NSRect) {
+        let p = NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 4, yRadius: 4)
+        p.lineWidth = 3
+        p.setLineDash([10, 6], count: 2, phase: 0)
+        NSColor.systemRed.withAlphaComponent(0.9).setStroke()
+        p.stroke()
+    }
+}
+
+extension AppDelegate {
+    @available(macOS 13.0, *)
+    func startRecording(_ r: NSRect, on screen: NSScreen) {
+        let rec = RegionRecorder()
+        recorderBox = rec
+        recording = true
+        recordStart = CACurrentMediaTime()
+
+        // çerçeve: seçilen alanın hemen dışında
+        let frame = r.insetBy(dx: -5, dy: -5)
+        let w = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = false
+        w.ignoresMouseEvents = true
+        w.level = .screenSaver
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        w.contentView = RecordBorderView(frame: NSRect(origin: .zero, size: frame.size))
+        w.orderFrontRegardless()
+        recordBorder = w
+        showRecordControl(near: r)
+
+        // kayıt sürerken gözlere tıklamak kaydı durdurur
+        statusItem.menu = nil
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(stopRecordingFromClick)
+
+        rec.onError = { [weak self] msg in
+            guard let self = self, self.recording else { return }
+            self.cleanupRecordingUI()
+            self.recorderBox = nil
+            self.alert("Kayıt durdu", msg)
+        }
+        rec.start(rect: r, on: screen) { [weak self] err in
+            guard let err = err else { return }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.cleanupRecordingUI()
+                self.recorderBox = nil
+                self.alert("Kayıt başlatılamadı", err)
+            }
+        }
+        recordStopTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
+            self?.toast("1 dakika doldu, kayıt durduruldu")
+            self?.stopRecording()
+        }
+        toast("Kayıt başladı")
+    }
+
+    @objc func stopRecordingFromClick() { stopRecording() }
+
+    /// Kaydedilen alanın altında (yer yoksa üstünde) süre ve "Durdur" düğmesi
+    func showRecordControl(near r: NSRect) {
+        let w: CGFloat = 170, h: CGFloat = 36
+        let screen = NSScreen.screens.first { NSMouseInRect(NSPoint(x: r.midX, y: r.midY), $0.frame, false) } ?? NSScreen.main
+        let vf = screen?.visibleFrame ?? r
+        var y = r.minY - h - 12
+        if y < vf.minY + 4 { y = min(r.maxY + 12, vf.maxY - h - 4) }
+        let x = min(max(r.midX - w / 2, vf.minX + 4), vf.maxX - w - 4)
+        let p = NSPanel(contentRect: NSRect(x: x, y: y, width: w, height: h),
+                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        p.becomesKeyOnlyIfNeeded = true
+
+        let bg = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        bg.wantsLayer = true
+        bg.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.85).cgColor
+        bg.layer?.cornerRadius = h / 2
+        let dot = NSView(frame: NSRect(x: 14, y: h / 2 - 5, width: 10, height: 10))
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = NSColor.systemRed.cgColor
+        dot.layer?.cornerRadius = 5
+        let time = NSTextField(labelWithString: "0:00")
+        time.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium)
+        time.textColor = .white
+        time.frame = NSRect(x: 30, y: (h - 18) / 2, width: 44, height: 18)
+        let stop = NSButton(title: "■ Durdur", target: self, action: #selector(stopRecordingFromClick))
+        stop.bezelStyle = .rounded
+        stop.controlSize = .regular
+        stop.frame = NSRect(x: w - 88, y: (h - 26) / 2, width: 80, height: 26)
+        stop.keyEquivalent = "\u{1b}"                 // Esc da durdurur (pencere seçiliyse)
+        for v in [dot, time, stop] { bg.addSubview(v) }
+        p.contentView = bg
+        p.orderFrontRegardless()
+        recordControl = p
+
+        recordClock = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let s = Int(CACurrentMediaTime() - self.recordStart)
+            time.stringValue = String(format: "%d:%02d", s / 60, s % 60)
+            dot.alphaValue = s % 2 == 0 ? 1 : 0.35
+        }
+    }
+
+    func cleanupRecordingUI() {
+        recording = false
+        recordStopTimer?.invalidate(); recordStopTimer = nil
+        recordBorder?.orderOut(nil); recordBorder = nil
+        recordControl?.orderOut(nil); recordControl = nil
+        recordClock?.invalidate(); recordClock = nil
+        statusItem.button?.action = nil
+        statusItem.menu = buildMenu()
+        lastDrawKey = ""
+    }
+
+    func stopRecording() {
+        guard recording else { return }
+        cleanupRecordingUI()
+        guard #available(macOS 13.0, *), let rec = recorderBox as? RegionRecorder else { return }
+        recorderBox = nil
+        let asGIF = Pref.recordFormat == 1
+        if asGIF { toast("GIF hazırlanıyor…", duration: 4) }
+        rec.stop { [weak self] url in
+            guard let url = url else {
+                DispatchQueue.main.async { self?.toast("Kayıt boş, kaydedilmedi") }
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                var out = url
+                if asGIF {
+                    let gif = url.deletingPathExtension().appendingPathExtension("gif")
+                    if GIFMaker.convert(url, to: gif) { out = gif; try? FileManager.default.removeItem(at: url) }
+                }
+                DispatchQueue.main.async { self?.finishRecording(out) }
+            }
+        }
+    }
+
+    func finishRecording(_ tmp: URL) {
+        let fm = FileManager.default
+        guard let desk = fm.urls(for: .desktopDirectory, in: .userDomainMask).first else { return }
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd 'saat' HH.mm.ss"
+        let ext = tmp.pathExtension
+        var dest = desk.appendingPathComponent("Googly Kayıt \(f.string(from: Date())).\(ext)")
+        var i = 2
+        while fm.fileExists(atPath: dest.path) {
+            dest = desk.appendingPathComponent("Googly Kayıt \(f.string(from: Date())) (\(i)).\(ext)"); i += 1
+        }
+        do { try fm.moveItem(at: tmp, to: dest) } catch { alert("Kayıt kaydedilemedi", error.localizedDescription); return }
+        // dosyayı panoya koy: Finder'a, Slack'e vb. doğrudan yapıştırılabilir
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.writeObjects([dest as NSURL])
+        lastChangeCount = pb.changeCount
+        surprise(0.8)
+        toast("\(ext.uppercased()) masaüstüne kaydedildi ✓")
+    }
+}
+
+// MARK: - Dosya araçları (gözlere sürükle-bırak)
+
+enum ImageTools {
+    static func load(_ url: URL) -> CGImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(src, 0, nil)
+    }
+
+    static func isImage(_ url: URL) -> Bool {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return false }
+        return CGImageSourceGetCount(src) > 0
+    }
+
+    static func uniqueURL(nextTo url: URL, suffix: String, ext: String) -> URL {
+        let dir = url.deletingLastPathComponent()
+        let base = url.deletingPathExtension().lastPathComponent + suffix
+        var out = dir.appendingPathComponent(base).appendingPathExtension(ext)
+        var i = 2
+        while FileManager.default.fileExists(atPath: out.path) {
+            out = dir.appendingPathComponent("\(base) (\(i))").appendingPathExtension(ext); i += 1
+        }
+        return out
+    }
+
+    static func write(_ img: CGImage, to url: URL, type: String, quality: Double? = nil) -> Bool {
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, type as CFString, 1, nil) else { return false }
+        var props: [CFString: Any] = [:]
+        if let q = quality { props[kCGImageDestinationLossyCompressionQuality] = q }
+        CGImageDestinationAddImage(dest, img, props as CFDictionary)
+        return CGImageDestinationFinalize(dest)
+    }
+
+    static func fileSize(_ url: URL) -> Int {
+        ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue ?? 0
+    }
+
+    static func sizeText(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    /// Görselde gerçekten saydam piksel var mı (küçültülmüş kopyada bakar)
+    static func hasTransparency(_ img: CGImage) -> Bool {
+        switch img.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: return false
+        default: break
+        }
+        let w = min(img.width, 512), h = max(1, Int(CGFloat(img.height) * CGFloat(w) / CGFloat(max(img.width, 1))))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return true }
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let data = ctx.data else { return true }
+        let p = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        for i in stride(from: 3, to: w * h * 4, by: 4) where p[i] < 255 { return true }
+        return false
+    }
+
+    static func nearestPowerOfTwo(_ x: Int) -> Int {
+        let p = Int(pow(2.0, (log2(Double(max(x, 1)))).rounded()))
+        return min(max(p, 1), 8192)
+    }
+
+    static func resized(_ img: CGImage, width: Int, height: Int) -> CGImage? {
+        guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return ctx.makeImage()
+    }
+
+    enum Job: Int { case png, compress, pot }
+
+    /// Sonuç: kısa açıklama (hata varsa nil)
+    static func run(_ job: Job, on url: URL) -> String? {
+        guard let img = load(url) else { return nil }
+        switch job {
+        case .png:
+            if url.pathExtension.lowercased() == "png" { return "zaten PNG" }
+            let out = uniqueURL(nextTo: url, suffix: "", ext: "png")
+            return write(img, to: out, type: "public.png") ? out.lastPathComponent : nil
+        case .compress:
+            let before = fileSize(url)
+            let out: URL
+            if hasTransparency(img) {
+                out = uniqueURL(nextTo: url, suffix: "_kucuk", ext: "png")       // saydamlık korunur
+                guard write(img, to: out, type: "public.png") else { return nil }
+            } else {
+                out = uniqueURL(nextTo: url, suffix: "_kucuk", ext: "jpg")
+                guard write(img, to: out, type: "public.jpeg", quality: 0.8) else { return nil }
+            }
+            let after = fileSize(out)
+            if after >= before && before > 0 {
+                try? FileManager.default.removeItem(at: out)
+                return "daha fazla küçülmedi"
+            }
+            return "\(sizeText(before)) → \(sizeText(after))"
+        case .pot:
+            let w = nearestPowerOfTwo(img.width), h = nearestPowerOfTwo(img.height)
+            guard let r = resized(img, width: w, height: h) else { return nil }
+            let out = uniqueURL(nextTo: url, suffix: "_\(w)x\(h)", ext: "png")
+            return write(r, to: out, type: "public.png") ? "\(w)×\(h)" : nil
+        }
+    }
+}
+
+extension AppDelegate: NSWindowDelegate {
+    /// Gözlerin bulunduğu menü çubuğu penceresini dosya bırakmaya hazırla
+    func setupDropTarget() {
+        guard let w = statusItem.button?.window else { return }
+        w.registerForDraggedTypes([.fileURL])
+        w.delegate = self
+    }
+
+    func imageURLs(_ info: NSDraggingInfo) -> [URL] {
+        let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+                                                      options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        return urls.filter { ImageTools.isImage($0) }
+    }
+
+    @objc func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard !imageURLs(sender).isEmpty else { return [] }
+        surprise(0.7)
+        return .copy
+    }
+
+    @objc func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        imageURLs(sender).isEmpty ? [] : .copy
+    }
+
+    @objc func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = imageURLs(sender)
+        guard !urls.isEmpty else { return false }
+        DispatchQueue.main.async { self.showFileMenu(urls) }
+        return true
+    }
+
+    func showFileMenu(_ urls: [URL]) {
+        guard let button = statusItem.button else { return }
+        let m = NSMenu()
+        let head = NSMenuItem(title: urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) görsel", action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        m.addItem(head)
+        for (title, job) in [("PNG'ye çevir", ImageTools.Job.png),
+                             ("Sıkıştır (küçült)", .compress),
+                             ("2'nin kuvvetine boyutla (512, 1024…)", .pot)] {
+            let i = NSMenuItem(title: title, action: #selector(runFileJob(_:)), keyEquivalent: "")
+            i.target = self
+            i.tag = job.rawValue
+            i.representedObject = urls
+            m.addItem(i)
+        }
+        let y = button.isFlipped ? button.bounds.maxY + 4 : -4
+        m.popUp(positioning: nil, at: NSPoint(x: 0, y: y), in: button)
+    }
+
+    @objc func runFileJob(_ sender: NSMenuItem) {
+        guard let urls = sender.representedObject as? [URL], let job = ImageTools.Job(rawValue: sender.tag) else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let results = urls.map { ImageTools.run(job, on: $0) }
+            DispatchQueue.main.async {
+                let ok = results.compactMap { $0 }
+                if ok.isEmpty { self.toast("İşlem yapılamadı"); return }
+                self.surprise(0.6)
+                self.toast(urls.count == 1 ? "Hazır ✓ \(ok[0])" : "\(ok.count)/\(urls.count) dosya hazır ✓")
+            }
+        }
+    }
+}
+
+// MARK: - Göz kostümleri ve ortam
+
+enum Costume {
+    /// Göz bebeği seçenekleri: (ad, doku; nil = klasik siyah)
+    static let pupilOptions: [(name: String, tex: String?)] = [
+        ("Klasik siyah", nil), ("Mavi", "pupil_blue"), ("Yeşil", "pupil_green"), ("Mor", "pupil_purple"),
+        ("Turuncu", "pupil_orange"), ("Kalp ❤️", "pupil_heart"), ("Yıldız ⭐️", "pupil_star"),
+        ("Elmas 💎", "pupil_diamond"), ("Parıltı ✨", "pupil_sparkle"),
+    ]
+    static var pupilNames: [String] { pupilOptions.map { $0.name } }
+
+    /// Gözlükler: (ad, doku, sol cam merkezi, sağ cam merkezi) — merkezler doku genişliğine oranla
+    static let glassesOptions: [(name: String, tex: String?, left: CGFloat, right: CGFloat)] = [
+        ("Yok", nil, 0, 0),
+        ("Siyah yuvarlak", "glasses_black", 0.232, 0.767),
+        ("Kedi gözü", "glasses_cat", 0.247, 0.746),
+        ("Kare", "glasses_square", 0.229, 0.768),
+        ("Altın", "glasses_gold", 0.227, 0.775),
+    ]
+    static var glassesNames: [String] { glassesOptions.map { $0.name } }
+    static var hasGlasses: Bool { glassesOptions[min(max(Pref.glasses, 0), glassesOptions.count - 1)].tex != nil }
+
+    /// Kaşlar (EyeBrows.png'den): (ad, doku öneki)
+    static let browOptions: [(name: String, tex: String?)] = [
+        ("Yok", nil), ("Kemerli", "arch"), ("Kızgın", "angry"), ("Endişeli", "worried"), ("Neşeli", "happy"),
+    ]
+    static var browNames: [String] { browOptions.map { $0.name } }
+
+    static func pupilTexture() -> NSImage? {
+        guard let name = pupilOptions[min(max(Pref.eyeColor, 0), pupilOptions.count - 1)].tex else { return nil }
+        return Tex.pupils[name]
+    }
+
+    /// Renkli iris + ortasında küçük siyah göz bebeği
+    static func drawIris(_ color: NSColor, in r: NSRect) {
+        let light = color.highlight(withLevel: 0.35) ?? color
+        let dark = color.shadow(withLevel: 0.45) ?? color
+        NSGradient(colors: [light, color, dark])?.draw(in: NSBezierPath(ovalIn: r), relativeCenterPosition: NSPoint(x: 0.3, y: 0.35))
+        let ps = r.width * 0.5
+        Tex.pupil.draw(in: NSRect(x: r.midX - ps / 2, y: r.midY - ps / 2, width: ps, height: ps))
+    }
+
+    static func batteryLow() -> Bool {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return false }
+        for src in list {
+            guard let d = IOPSGetPowerSourceDescription(info, src)?.takeUnretainedValue() as? [String: Any] else { continue }
+            let cap = d[kIOPSCurrentCapacityKey] as? Int ?? 100
+            let full = max(d[kIOPSMaxCapacityKey] as? Int ?? 100, 1)
+            let onAC = (d[kIOPSPowerSourceStateKey] as? String) == kIOPSACPowerValue
+            if !onAC && cap * 100 / full < 20 { return true }
+        }
+        return false
+    }
+
+    /// 0: zinde, 0.3: gece yarısı uykulu, 0.45: pil bitmek üzere
+    static func ambientDroop() -> CGFloat {
+        if batteryLow() { return 0.45 }
+        let hour = Calendar.current.component(.hour, from: Date())
+        return hour < 5 ? 0.3 : 0
+    }
+}
+
+// MARK: - Güncelleyici
+
+enum Updater {
+    static let repo = "generece/GooglyEyes"
+
+    /// Bu kopyanın derlendiği commit (build.sh Info.plist'e yazar)
+    static var installedCommit: String {
+        Bundle.main.object(forInfoDictionaryKey: "GooglyCommit") as? String ?? "unknown"
+    }
+
+    /// En son yayınlanan hazır sürüm: commit (kısa, 7 karakter; etiket biçimi v1.1-abc1234) ve yenilikler
+    static func latestRelease(_ completion: @escaping ((commit: String, notes: String)?) -> Void) {
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = obj["tag_name"] as? String,
+                  let short = tag.split(separator: "-").last, short.count >= 7 else { completion(nil); return }
+            let notes = (obj["body"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            completion((String(short), notes))
+        }.resume()
+    }
+
+    /// install.sh'ı GitHub'dan çalıştırır: indir, derle, kur, yeniden başlat.
+    /// Çıktı dosyaya yazılır: kurulum bu uygulamayı kapattığında script yarıda kalmasın diye.
+    static func install(_ completion: @escaping (Bool, String) -> Void) {
+        let logURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs/GooglyEyes-update.log")
+        try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-c", "set -o pipefail; curl -fsSL https://raw.githubusercontent.com/\(repo)/main/install.sh | bash > \"$1\" 2>&1",
+                       "googly-update", logURL.path]
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        p.terminationHandler = { proc in
+            let text = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+            completion(proc.terminationStatus == 0, text)
+        }
+        do { try p.run() } catch { completion(false, error.localizedDescription) }
+    }
+}
+
 // MARK: - WebP → PNG
 
 /// İndirilenler ve Masaüstü'nü izler; yeni gelen .webp dosyalarını aynı isimle .png'ye çevirir.
@@ -887,7 +2374,9 @@ final class WebpWatcher {
 
     private func webps(in dir: URL) -> [URL] {
         let items = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
-        return items.filter { $0.pathExtension.lowercased() == "webp" }
+        var exts: Set<String> = ["webp", "avif"]
+        if Pref.convertHeic { exts.formUnion(["heic", "heif"]) }
+        return items.filter { exts.contains($0.pathExtension.lowercased()) }
     }
 
     private func scheduleScan() {
@@ -1015,6 +2504,7 @@ final class SelectionView: NSView {
     var current: NSPoint?
     var menuBarHeight: CGFloat = 0
     var frozen: NSImage?
+    var hint: String?
     var onDone: ((NSRect?) -> Void)?
     var finished = false
 
@@ -1043,6 +2533,16 @@ final class SelectionView: NSView {
             NSGraphicsContext.restoreGraphicsState()
         } else {
             NSColor.black.withAlphaComponent(0.12).setFill(); rest.fill(using: .copy)
+        }
+        if let h = hint, selRect == nil {
+            let str = NSAttributedString(string: h, attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .medium), .foregroundColor: NSColor.white])
+            let sz = str.size()
+            let bg = NSRect(x: bounds.midX - sz.width / 2 - 12, y: bounds.maxY - menuBarHeight - sz.height - 40,
+                            width: sz.width + 24, height: sz.height + 12)
+            NSColor.black.withAlphaComponent(0.7).setFill()
+            NSBezierPath(roundedRect: bg, xRadius: 8, yRadius: 8).fill()
+            str.draw(at: NSPoint(x: bg.minX + 12, y: bg.minY + 6))
         }
         guard let s = selRect, s.width > 0, s.height > 0 else { return }
         if frozen == nil { NSColor.clear.setFill(); s.fill(using: .copy) }
@@ -1149,6 +2649,12 @@ enum ZGlyph {
 // MARK: - Pano / Masaüstü
 
 enum Output {
+    static func copyText(_ t: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(t, forType: .string)
+    }
+
     static func toClipboard(png: Data) {
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -1173,7 +2679,8 @@ enum Output {
 
 // MARK: - İşaretleme görünümü
 
-enum Tool: Int { case pen, arrow, rect, marker, text, number, pixelate, blur, eraser, crop }
+/// Sıra, araç çubuğundaki düğme sırasıyla aynı olmalı
+enum Tool: Int { case pen, arrow, rect, marker, text, emoji, number, ruler, eyedropper, ocr, pixelate, blur, eraser, crop }
 
 /// Yazı aracı için font seçenekleri
 enum TextFont: Int, CaseIterable {
@@ -1219,6 +2726,9 @@ struct Mark {
     var font: TextFont = .rounded
     var arrow: ArrowStyle = .sharp
     var curved = false
+    var labelPx: CGFloat = 0     // cetvel yazısının boyu (görsel pikseli)
+    var soft = false             // fosforlu kalem: yumuşak kenar
+    var shape = 0                // şekil aracı: 0 kutu, 1 daire/elips, 2 düz çizgi
 }
 
 // MARK: - Yol yardımcıları
@@ -1347,12 +2857,91 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
     var arrowCurved = UserDefaults.standard.bool(forKey: "arrowCurved") {
         didSet { UserDefaults.standard.set(arrowCurved, forKey: "arrowCurved") }
     }
+    var shapeKind = UserDefaults.standard.integer(forKey: "shapeKind") {
+        didSet { UserDefaults.standard.set(shapeKind, forKey: "shapeKind") }
+    }
+    var markerSoft = UserDefaults.standard.bool(forKey: "markerSoft") {
+        didSet { UserDefaults.standard.set(markerSoft, forKey: "markerSoft") }
+    }
+    var emoji = UserDefaults.standard.string(forKey: "emoji") ?? "👀" {
+        didSet { UserDefaults.standard.set(emoji, forKey: "emoji") }
+    }
     var eraserMode = EraserMode(rawValue: UserDefaults.standard.integer(forKey: "eraserMode")) ?? .whole {
         didSet { UserDefaults.standard.set(eraserMode.rawValue, forKey: "eraserMode") }
     }
     var onChange: (() -> Void)?
     var onCommand: ((String) -> Void)?
     var onCropped: ((Bool) -> Void)?
+    var onPickColor: ((NSColor) -> Void)?
+    var onStatus: ((String) -> Void)?
+
+    // kısa görsel geri bildirim: seçilen alan yeşil parlar + ortada balon
+    var flash: (rect: CGRect?, text: String, ok: Bool, swatch: NSColor?, start: CFTimeInterval)?
+    var flashTimer: Timer?
+    let flashDuration: CFTimeInterval = 1.6
+
+    func showFlash(_ text: String, rect: CGRect? = nil, ok: Bool = true, swatch: NSColor? = nil) {
+        flash = (rect, text, ok, swatch, CACurrentMediaTime())
+        flashTimer?.invalidate()
+        flashTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] t in
+            guard let self = self, let f = self.flash else { t.invalidate(); return }
+            if CACurrentMediaTime() - f.start > self.flashDuration { self.flash = nil; t.invalidate() }
+            self.needsDisplay = true
+        }
+        needsDisplay = true
+    }
+
+    func drawFlash() {
+        guard let f = flash else { return }
+        let t = CACurrentMediaTime() - f.start
+        let tint = f.ok ? NSColor.systemGreen : NSColor.systemOrange
+        if let r = f.rect {
+            let a = max(0, 1 - t / 0.9)
+            let v = viewRect(of: r)
+            tint.withAlphaComponent(0.28 * a).setFill()
+            NSBezierPath(roundedRect: v, xRadius: 4, yRadius: 4).fill()
+            let b = NSBezierPath(roundedRect: v.insetBy(dx: 1, dy: 1), xRadius: 4, yRadius: 4)
+            b.lineWidth = 2
+            tint.withAlphaComponent(0.9 * a).setStroke()
+            b.stroke()
+        }
+        // balon: son 0.3 sn'de söner
+        let alpha = min(1, max(0, (flashDuration - t) / 0.3))
+        let str = NSAttributedString(string: f.text, attributes: [
+            .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(alpha)])
+        let sz = str.size()
+        let ir = imageRect()
+        let sw: CGFloat = f.swatch == nil ? 0 : 22
+        let bg = NSRect(x: ir.midX - (sz.width + sw) / 2 - 16, y: ir.maxY - sz.height - 30,
+                        width: sz.width + sw + 32, height: sz.height + 14)
+        tint.blended(withFraction: 0.35, of: .black)?.withAlphaComponent(0.92 * alpha).setFill()
+        NSBezierPath(roundedRect: bg, xRadius: bg.height / 2, yRadius: bg.height / 2).fill()
+        if let c = f.swatch {
+            let d: CGFloat = 16
+            let dot = NSRect(x: bg.minX + 12, y: bg.midY - d / 2, width: d, height: d)
+            c.withAlphaComponent(alpha).setFill(); NSBezierPath(ovalIn: dot).fill()
+            NSColor.white.withAlphaComponent(alpha).setStroke()
+            let ring = NSBezierPath(ovalIn: dot); ring.lineWidth = 1.5; ring.stroke()
+        }
+        str.draw(at: NSPoint(x: bg.minX + 16 + sw, y: bg.minY + 7))
+    }
+
+    /// Görseldeki bir pikselin rengi (p: görsel pikseli, sol-alt orijin)
+    func pixelColor(at p: CGPoint) -> NSColor? {
+        guard fullRect.contains(p), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let sx = CGFloat(cg.width) / pixelSize.width, sy = CGFloat(cg.height) / pixelSize.height
+        let x = Int(p.x * sx), y = Int((pixelSize.height - p.y) * sy)
+        guard let px = cg.cropping(to: CGRect(x: min(x, cg.width - 1), y: min(max(y, 0), cg.height - 1), width: 1, height: 1)) else { return nil }
+        // belleği bağlamın kendisi ayırır (geçici dizi işaretçisi kullanmak güvenli değil)
+        guard let ctx = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.draw(px, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard let data = ctx.data else { return nil }
+        let p8 = data.bindMemory(to: UInt8.self, capacity: 4)
+        return NSColor(srgbRed: CGFloat(p8[0]) / 255, green: CGFloat(p8[1]) / 255, blue: CGFloat(p8[2]) / 255, alpha: 1)
+    }
 
     // yazı aracı
     var editor: NSTextField?
@@ -1609,7 +3198,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         image.draw(in: fullRect)
         drawAll(includeCurrent: true)
 
-        if let c = current, c.tool == .pixelate || c.tool == .blur, let rr = rectOf(c) {
+        if let c = current, c.tool == .pixelate || c.tool == .blur || c.tool == .ocr, let rr = rectOf(c) {
             let p = NSBezierPath(rect: rr); p.lineWidth = 1.5 / scale
             p.setLineDash([6 / scale, 4 / scale], count: 2, phase: 0)
             NSColor.white.withAlphaComponent(0.9).setStroke(); p.stroke()
@@ -1617,6 +3206,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         NSGraphicsContext.restoreGraphicsState()
 
         if tool == .crop { drawCropOverlay() }
+        drawFlash()
     }
 
     /// İşaretler ayrı bir katmana çizilir; böylece silgi sadece işaretleri siler, görseli değil
@@ -1703,12 +3293,33 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             path.move(to: first)
             if m.points.count == 1 { path.line(to: CGPoint(x: first.x + 0.1, y: first.y)) }
             for p in m.points.dropFirst() { path.line(to: p) }
+            if m.tool == .marker && m.soft, let ctx = NSGraphicsContext.current?.cgContext {
+                // yumuşak kenar: daha ince çekirdek + aynı renkte geniş bulanık hale
+                let w = m.width * 4
+                ctx.saveGState()
+                ctx.setShadow(offset: .zero, blur: w * 0.9, color: m.color.withAlphaComponent(0.45).cgColor)
+                ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+                path.lineWidth = w * 0.55
+                m.color.withAlphaComponent(0.7).setStroke()
+                path.stroke()
+                ctx.endTransparencyLayer()
+                ctx.restoreGState()
+                return
+            }
             path.lineWidth = m.tool == .marker ? m.width * 4 : m.width
             (m.tool == .marker ? m.color.withAlphaComponent(0.35) : m.color).setStroke()
             path.stroke()
         case .rect:
-            guard let rr = rectOf(m) else { return }
-            let p = NSBezierPath(roundedRect: rr, xRadius: m.width, yRadius: m.width)
+            guard let rr = rectOf(m), let a = m.points.first, let b = m.points.last else { return }
+            let p: NSBezierPath
+            switch m.shape {
+            case 1: p = NSBezierPath(ovalIn: rr)
+            case 2:
+                p = NSBezierPath()
+                p.move(to: a); p.line(to: b)
+                p.lineCapStyle = .round
+            default: p = NSBezierPath(roundedRect: rr, xRadius: m.width, yRadius: m.width)
+            }
             p.lineWidth = m.width; m.color.setStroke(); p.stroke()
         case .arrow:
             drawArrow(m)
@@ -1722,6 +3333,12 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             let a = textAttributes(m)
             NSAttributedString(string: m.text, attributes: a.outline).draw(at: first)
             NSAttributedString(string: m.text, attributes: a.fill).draw(at: first)
+        case .emoji:
+            let s = AnnotationView.emojiString(m)
+            let sz = s.size()
+            s.draw(at: NSPoint(x: first.x - sz.width / 2, y: first.y - sz.height / 2))
+        case .ruler:
+            drawRuler(m)
         case .number:
             let d = m.width
             let circle = NSRect(x: first.x - d / 2, y: first.y - d / 2, width: d, height: d)
@@ -1752,7 +3369,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             ctx.addPath(cp)
             ctx.strokePath()
             ctx.restoreGState()
-        case .crop:
+        case .crop, .eyedropper, .ocr:
             break
         }
     }
@@ -1773,6 +3390,16 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
                 || hypot(p.x - last.x, p.y - last.y) <= arrowHeadSize(m) * 0.7 + tol
         case .rect:
             guard let rr = rectOf(m) else { return false }
+            if m.shape == 2, let a = m.points.first, let b = m.points.last {
+                return PathMath.segDist(p, a, b) <= m.width / 2 + tol
+            }
+            if m.shape == 1 {
+                // elipsin çizgisine yakınlık (normalize uzaklık)
+                let rx = max(rr.width / 2, 1), ry = max(rr.height / 2, 1)
+                let dx = p.x - rr.midX, dy = p.y - rr.midY
+                let d = sqrt(dx * dx / (rx * rx) + dy * dy / (ry * ry))
+                return abs(d - 1) * min(rx, ry) <= m.width / 2 + tol
+            }
             let outer = rr.insetBy(dx: -(m.width / 2 + tol), dy: -(m.width / 2 + tol))
             let inset = m.width / 2 + tol
             let inner = rr.insetBy(dx: inset, dy: inset)
@@ -1785,9 +3412,53 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             return NSRect(origin: first, size: sz).insetBy(dx: -tol, dy: -tol).contains(p)
         case .number:
             return hypot(p.x - first.x, p.y - first.y) <= m.width / 2 + tol
-        case .eraser, .crop:
+        case .emoji:
+            return hypot(p.x - first.x, p.y - first.y) <= m.width * 0.5 + tol
+        case .ruler:
+            guard let last = m.points.last else { return false }
+            return PathMath.segDist(p, first, last) <= max(m.width * 4, m.labelPx) + tol
+        case .eraser, .crop, .eyedropper, .ocr:
             return false
         }
+    }
+
+    static func emojiString(_ m: Mark) -> NSAttributedString {
+        let f = NSFont(name: "Apple Color Emoji", size: m.width) ?? NSFont.systemFont(ofSize: m.width)
+        return NSAttributedString(string: m.text, attributes: [.font: f])
+    }
+
+    /// Cetvel: çizgi, uçlarda dik çentikler, ortada piksel uzunluğu
+    func drawRuler(_ m: Mark) {
+        guard let a = m.points.first, let b = m.points.last else { return }
+        let dx = b.x - a.x, dy = b.y - a.y
+        let len = hypot(dx, dy)
+        guard len > 0.5 else { return }
+        let ux = dx / len, uy = dy / len
+        let tick = max(m.width * 4, m.labelPx * 0.8)
+        let p = NSBezierPath()
+        p.lineCapStyle = .round
+        p.move(to: a); p.line(to: b)
+        for e in [a, b] {
+            p.move(to: NSPoint(x: e.x - uy * tick / 2, y: e.y + ux * tick / 2))
+            p.line(to: NSPoint(x: e.x + uy * tick / 2, y: e.y - ux * tick / 2))
+        }
+        p.lineWidth = m.width
+        m.color.setStroke(); p.stroke()
+
+        let fs = max(m.labelPx, 4)
+        let text = NSAttributedString(string: "\(Int(len.rounded())) px", attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: fs, weight: .semibold), .foregroundColor: NSColor.white])
+        let sz = text.size()
+        // yazı çizginin hemen üstünde (çizgiye dik yönde biraz kaydırılmış)
+        let off = sz.height * 0.9 + m.width
+        var nx = -uy, ny = ux
+        if ny < 0 { nx = -nx; ny = -ny }
+        let c = NSPoint(x: (a.x + b.x) / 2 + nx * off, y: (a.y + b.y) / 2 + ny * off)
+        let bg = NSRect(x: c.x - sz.width / 2 - fs * 0.4, y: c.y - sz.height / 2 - fs * 0.15,
+                        width: sz.width + fs * 0.8, height: sz.height + fs * 0.3)
+        NSColor.black.withAlphaComponent(0.72).setFill()
+        NSBezierPath(roundedRect: bg, xRadius: fs * 0.35, yRadius: fs * 0.35).fill()
+        text.draw(at: NSPoint(x: c.x - sz.width / 2, y: c.y - sz.height / 2))
     }
 
     func eraseWholeAt(_ p: CGPoint) {
@@ -1811,6 +3482,18 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         case .number:
             pushHistory()
             marks.append(Mark(tool: .number, color: color, width: (18 + lineWidth * 2) / scale, points: [p]))
+        case .emoji:
+            pushHistory()
+            marks.append(Mark(tool: .emoji, color: .clear, width: (24 + lineWidth * 4) / scale, points: [p], text: emoji))
+        case .eyedropper:
+            if let c = pixelColor(at: p) {
+                color = c
+                onPickColor?(c)
+            }
+        case .ruler:
+            var m = Mark(tool: .ruler, color: color, width: max(lineWidth * 0.5, 1.5) / scale, points: [p])
+            m.labelPx = 12 / scale
+            current = m
         case .eraser:
             if eraserMode == .whole {
                 erasedThisDrag = false
@@ -1826,7 +3509,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             }
         default:
             current = Mark(tool: tool, color: color, width: lineWidth / scale, points: [p],
-                           arrow: arrowStyle, curved: arrowCurved)
+                           arrow: arrowStyle, curved: arrowCurved, soft: markerSoft, shape: shapeKind)
         }
     }
     override func mouseDragged(with e: NSEvent) {
@@ -1849,6 +3532,40 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         if tool == .eraser && eraserMode == .whole { erasedThisDrag = false; return }
         guard let c = current else { return }
         current = nil
+        if c.tool == .ocr {
+            // seçilen alandaki metni tanı ve panoya kopyala (işaret eklenmez)
+            guard let rr = rectOf(c)?.intersection(fullRect), rr.width * scale > 4, rr.height * scale > 4 else {
+                onStatus?("Daha büyük bir alan seç"); return
+            }
+            guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                onStatus?("Görsel okunamadı"); return
+            }
+            let sx = CGFloat(cg.width) / pixelSize.width, sy = CGFloat(cg.height) / pixelSize.height
+            let px = CGRect(x: rr.minX * sx, y: (pixelSize.height - rr.maxY) * sy, width: rr.width * sx, height: rr.height * sy).integral
+            guard let part = cg.cropping(to: px.intersection(CGRect(x: 0, y: 0, width: cg.width, height: cg.height))) else {
+                onStatus?("Seçilen alan okunamadı"); return
+            }
+            onStatus?("Metin okunuyor…")
+            OCR.recognize(part) { [weak self] text, err in
+                DispatchQueue.main.async {
+                    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let err = err {
+                        self?.onStatus?("Metin okunamadı: \(err)")
+                        self?.showFlash("Metin okunamadı", rect: rr, ok: false)
+                        return
+                    }
+                    if t.isEmpty {
+                        self?.onStatus?("Metin bulunamadı")
+                        self?.showFlash("Bu alanda metin bulunamadı", rect: rr, ok: false)
+                        return
+                    }
+                    Output.copyText(t)
+                    self?.showFlash("✓ Metin kopyalandı (\(t.count) karakter)", rect: rr)
+                    self?.onStatus?("Metin kopyalandı ✓ (\(t.count) karakter)")
+                }
+            }
+            return
+        }
         switch c.tool {
         case .pen, .marker, .eraser:
             break
@@ -1979,6 +3696,9 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
     let onClose: (AnnotationWindowController) -> Void
     let onSaved: () -> Void
     var colorButtons: [NSButton] = []
+    let customColorButton = NSButton(title: "", target: nil, action: nil)
+    var customColor: NSColor?
+    var colorSampler: NSColorSampler?
     let status = NSTextField(labelWithString: "")
     let undoButton = NSButton(title: "Geri Al", target: nil, action: nil)
     var toolControl: NSSegmentedControl!
@@ -1990,12 +3710,16 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
     static let tools: [(label: String, symbol: String?, tip: String)] = [
         ("✏️", nil, "Kalem"),
         ("↗", nil, "Ok: tıklayınca sivri/yumuşak ve düz/eğri seç"),
-        ("▢", nil, "Kutu"),
-        ("🖍", nil, "Fosforlu kalem"),
+        ("▢", nil, "Şekil: tıklayınca kutu / daire / düz çizgi seç"),
+        ("🖍", nil, "Fosforlu kalem: tıklayınca sert / yumuşak kenar seç"),
         ("T", nil, "Yazı: tıklayınca font seç; resme tıkla, yaz, Enter"),
+        ("😀", nil, "Emoji: tıklayınca emoji seç; resme tıklayarak yapıştır"),
         ("①", nil, "Numaralı işaret: her tık 1, 2, 3…"),
-        ("▦", nil, "Pikselleştir: alanı sürükleyerek seç"),
-        ("◌", nil, "Bulanıklaştır: alanı sürükleyerek seç"),
+        ("Cetvel", "ruler", "Cetvel: iki nokta arasını sürükle, uzunluğu piksel olarak yazar"),
+        ("Renk", "eyedropper", "Renk seç: büyüteçle istediğin yere tıkla; HEX kopyalanır ve kalem rengi olur"),
+        ("Metin", "text.viewfinder", "Metni kopyala: yazının olduğu alanı sürükleyerek seç"),
+        ("Piksel", "checkerboard.rectangle", "Pikselleştir: gizlemek istediğin alanı sürükleyerek seç"),
+        ("Bulanık", "drop.halffull", "Bulanıklaştır: gizlemek istediğin alanı sürükleyerek seç"),
         ("Silgi", "eraser", "Silgi: tıklayınca bütün işaret / sadece dokunduğun yer seç"),
         ("Kırp", "crop", "Kırp: kenarları sürükle, Enter ile uygula")]
 
@@ -2008,14 +3732,14 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         let ptSize = NSSize(width: cv.pixelSize.width / 2, height: cv.pixelSize.height / 2)
         let maxW = screen.width * 0.85, maxH = screen.height * 0.85 - 56
         let s = min(1, maxW / max(ptSize.width + 40, 1), maxH / max(ptSize.height + 40, 1))
-        let size = NSSize(width: max(1000, (ptSize.width + 40) * s), height: max(440, (ptSize.height + 40) * s + 56))
+        let size = NSSize(width: max(1100, (ptSize.width + 40) * s), height: max(440, (ptSize.height + 40) * s + 56))
 
         let win = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                            styleMask: [.titled, .closable, .resizable, .miniaturizable],
                            backing: .buffered, defer: false)
         win.title = "Googly İşaretle"
         win.isReleasedWhenClosed = false
-        win.minSize = NSSize(width: 960, height: 360)
+        win.minSize = NSSize(width: 1060, height: 360)
         win.center()
         super.init(window: win)
         win.delegate = self
@@ -2024,6 +3748,21 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         canvas.onCommand = { [weak self] cmd in
             if cmd == "undo" { self?.undo() } else { self?.save() }
         }
+        canvas.onPickColor = { [weak self] c in
+            guard let self = self else { return }
+            self.canvas.color = c
+            let hex = String(format: "#%02X%02X%02X", Int((c.redComponent * 255).rounded()),
+                             Int((c.greenComponent * 255).rounded()), Int((c.blueComponent * 255).rounded()))
+            Output.copyText(hex)
+            self.customColor = c
+            self.customColorButton.layer?.backgroundColor = c.cgColor
+            self.customColorButton.isHidden = false
+            self.highlightColor(-1)
+            self.canvas.editor?.textColor = c
+            self.status.stringValue = "\(hex) kopyalandı ✓ · kalem rengi oldu"
+            self.canvas.showFlash("✓ \(hex) kopyalandı · kalem rengi oldu", swatch: c)
+        }
+        canvas.onStatus = { [weak self] t in self?.status.stringValue = t }
         canvas.onCropped = { [weak self] applied in
             // Enter / Esc sonrası son çizim aracına dön
             guard let self = self else { return }
@@ -2049,6 +3788,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         }
         tools.selectedSegment = 0
         toolControl = tools
+        tools.setLabel(["▢", "◯", "╱"][min(max(canvas.shapeKind, 0), 2)], forSegment: Tool.rect.rawValue)
 
         let colors = NSStackView(); colors.spacing = 5
         for (i, c) in Self.palette.enumerated() {
@@ -2061,11 +3801,30 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
             b.heightAnchor.constraint(equalToConstant: 18).isActive = true
             colors.addArrangedSubview(b); colorButtons.append(b)
         }
+        // renk seçiciyle alınan renk: paletin sonunda belirir
+        customColorButton.target = self; customColorButton.action = #selector(customColorClicked)
+        customColorButton.isBordered = false; customColorButton.wantsLayer = true
+        customColorButton.layer?.cornerRadius = 9
+        customColorButton.translatesAutoresizingMaskIntoConstraints = false
+        customColorButton.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        customColorButton.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        customColorButton.isHidden = true
+        customColorButton.toolTip = "Renk seçiciyle aldığın renk"
+        colors.addArrangedSubview(customColorButton)
+        let well = NSColorWell(frame: NSRect(x: 0, y: 0, width: 26, height: 20))
+        if #available(macOS 13.0, *) { well.colorWellStyle = .minimal }
+        well.color = .systemRed
+        well.target = self; well.action = #selector(colorWellChanged(_:))
+        well.toolTip = "İstediğin rengi seç"
+        well.translatesAutoresizingMaskIntoConstraints = false
+        well.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        well.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        colors.addArrangedSubview(well)
         highlightColor(0)
 
         let slider = NSSlider(value: 4, minValue: 1, maxValue: 16, target: self, action: #selector(widthChanged(_:)))
         slider.translatesAutoresizingMaskIntoConstraints = false
-        slider.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        slider.widthAnchor.constraint(equalToConstant: 180).isActive = true
         slider.toolTip = "Kalınlık / yazı boyu / numara boyu / silgi boyu"
 
         undoButton.target = self; undoButton.action = #selector(undo); undoButton.bezelStyle = .rounded
@@ -2100,12 +3859,21 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         window?.initialFirstResponder = canvas
     }
 
+    /// idx: palet sırası; -1 = renk seçiciyle alınan özel renk
     func highlightColor(_ idx: Int) {
         for (i, b) in colorButtons.enumerated() {
             let selected = i == idx
             b.layer?.borderWidth = selected ? 2.5 : (Self.palette[i] == .white ? 1 : 0)
             b.layer?.borderColor = (selected ? NSColor.controlAccentColor : NSColor.systemGray).cgColor
         }
+        customColorButton.layer?.borderWidth = idx == -1 ? 2.5 : 1
+        customColorButton.layer?.borderColor = (idx == -1 ? NSColor.controlAccentColor : NSColor.systemGray).cgColor
+    }
+
+    @objc func customColorClicked() {
+        guard let c = customColor else { return }
+        canvas.color = c; highlightColor(-1)
+        canvas.editor?.textColor = c
     }
 
     @objc func toolChanged(_ s: NSSegmentedControl) {
@@ -2116,6 +3884,39 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         switch t {
         case .arrow: popUpMenu(arrowMenu(), under: s, segment: s.selectedSegment)
         case .text: popUpMenu(fontMenu(), under: s, segment: s.selectedSegment)
+        case .emoji: popUpMenu(emojiMenu(), under: s, segment: s.selectedSegment)
+        case .rect:
+            let m = NSMenu()
+            for (i, t) in ["▢  Kutu", "◯  Daire / Elips", "╱  Düz çizgi"].enumerated() {
+                m.addItem(menuItem(t, #selector(setShape(_:)), tag: i, on: canvas.shapeKind == i))
+            }
+            popUpMenu(m, under: s, segment: s.selectedSegment)
+        case .marker:
+            let m = NSMenu()
+            m.addItem(menuItem("Sert kenar", #selector(setMarkerSoft(_:)), tag: 0, on: !canvas.markerSoft))
+            m.addItem(menuItem("Yumuşak kenar", #selector(setMarkerSoft(_:)), tag: 1, on: canvas.markerSoft))
+            popUpMenu(m, under: s, segment: s.selectedSegment)
+        case .ruler: status.stringValue = "Ölçmek istediğin iki nokta arasını sürükle"
+        case .eyedropper:
+            // macOS'un büyüteçli renk seçicisi: neyi seçtiğini görerek ekranın herhangi bir yerinden renk al
+            status.stringValue = "Rengini almak istediğin yere tıkla (Esc: vazgeç)"
+            let sampler = NSColorSampler()
+            colorSampler = sampler
+            sampler.show { [weak self] color in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.colorSampler = nil
+                    if let c = color?.usingColorSpace(.sRGB) {
+                        self.canvas.onPickColor?(c)
+                    } else {
+                        self.status.stringValue = ""
+                    }
+                    // son çizim aracına dön; hemen o renkle çizilebilsin
+                    self.toolControl.selectedSegment = self.lastDrawTool.rawValue
+                    self.canvas.tool = self.lastDrawTool
+                }
+            }
+        case .ocr: status.stringValue = "Metnini kopyalamak istediğin alanı sürükle"
         case .eraser:
             status.stringValue = ""
             popUpMenu(eraserMenu(), under: s, segment: s.selectedSegment)
@@ -2169,6 +3970,38 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
     @objc func setArrowShape(_ i: NSMenuItem) { canvas.arrowCurved = i.tag == 1 }
     @objc func setEraserMode(_ i: NSMenuItem) { canvas.eraserMode = EraserMode(rawValue: i.tag) ?? .whole }
     @objc func setTextFont(_ i: NSMenuItem) { canvas.textFont = TextFont(rawValue: i.tag) ?? .rounded }
+
+    static let emojis = ["👀", "😂", "😍", "🤔", "😱", "👍", "👎", "❤️", "🔥", "✅", "❌", "⭐️", "💯", "⚠️", "❓", "💡", "🎯", "🎉"]
+
+    func emojiMenu() -> NSMenu {
+        let m = NSMenu()
+        for e in Self.emojis {
+            let i = NSMenuItem(title: e, action: #selector(setEmoji(_:)), keyEquivalent: "")
+            i.target = self
+            i.state = canvas.emoji == e ? .on : .off
+            i.attributedTitle = NSAttributedString(string: e, attributes: [.font: NSFont.systemFont(ofSize: 18)])
+            m.addItem(i)
+        }
+        return m
+    }
+
+    @objc func setEmoji(_ i: NSMenuItem) { canvas.emoji = i.title }
+    @objc func setMarkerSoft(_ i: NSMenuItem) { canvas.markerSoft = i.tag == 1 }
+    @objc func setShape(_ i: NSMenuItem) {
+        canvas.shapeKind = i.tag
+        toolControl.setLabel(["▢", "◯", "╱"][min(max(i.tag, 0), 2)], forSegment: Tool.rect.rawValue)
+    }
+
+    /// Renk kutusu: macOS renk penceresinden istenen her renk
+    @objc func colorWellChanged(_ w: NSColorWell) {
+        let c = w.color.usingColorSpace(.sRGB) ?? w.color
+        canvas.color = c
+        canvas.editor?.textColor = c
+        customColor = c
+        customColorButton.layer?.backgroundColor = c.cgColor
+        customColorButton.isHidden = false
+        highlightColor(-1)
+    }
 
     @objc func colorChanged(_ b: NSButton) {
         canvas.color = Self.palette[b.tag]; highlightColor(b.tag)

@@ -50,6 +50,11 @@ xcrun swiftc -O -target "$(uname -m)-apple-macos12.0" \
 cp Info.plist "$APP/Contents/"
 cp Resources/* "$APP/Contents/Resources/"
 
+# Hangi sürüm olduğunu uygulamaya yaz (Güncellemeleri Kontrol Et bunu GitHub'la karşılaştırır)
+COMMIT="${GOOGLY_COMMIT:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+/usr/libexec/PlistBuddy -c "Add :GooglyCommit string $COMMIT" "$APP/Contents/Info.plist" >/dev/null 2>&1 \
+  || /usr/libexec/PlistBuddy -c "Set :GooglyCommit $COMMIT" "$APP/Contents/Info.plist"
+
 if codesign --force --deep --sign "$IDENT" "$APP" 2>/tmp/googly-sign.log; then
   echo "→ Sabit sertifikayla imzalandı."
 else
@@ -60,7 +65,8 @@ fi
 
 DEST="$HOME/Applications/GooglyEyes.app"
 mkdir -p "$HOME/Applications"
-pkill -x GooglyEyes 2>/dev/null || true
+# -a: güncelleme uygulamanın içinden başlatıldığında da onu kapat (pkill varsayılan olarak kendini başlatanları atlar)
+pkill -a -x GooglyEyes 2>/dev/null || true
 sleep 0.5
 rm -rf "$DEST"
 cp -R "$APP" "$DEST"
