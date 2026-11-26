@@ -2868,12 +2868,12 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
     var onStatus: ((String) -> Void)?
 
     // kısa görsel geri bildirim: seçilen alan yeşil parlar + ortada balon
-    var flash: (rect: CGRect?, text: String, ok: Bool, start: CFTimeInterval)?
+    var flash: (rect: CGRect?, text: String, ok: Bool, swatch: NSColor?, start: CFTimeInterval)?
     var flashTimer: Timer?
     let flashDuration: CFTimeInterval = 1.6
 
-    func showFlash(_ text: String, rect: CGRect? = nil, ok: Bool = true) {
-        flash = (rect, text, ok, CACurrentMediaTime())
+    func showFlash(_ text: String, rect: CGRect? = nil, ok: Bool = true, swatch: NSColor? = nil) {
+        flash = (rect, text, ok, swatch, CACurrentMediaTime())
         flashTimer?.invalidate()
         flashTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] t in
             guard let self = self, let f = self.flash else { t.invalidate(); return }
@@ -2904,10 +2904,19 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             .foregroundColor: NSColor.white.withAlphaComponent(alpha)])
         let sz = str.size()
         let ir = imageRect()
-        let bg = NSRect(x: ir.midX - sz.width / 2 - 16, y: ir.maxY - sz.height - 30, width: sz.width + 32, height: sz.height + 14)
+        let sw: CGFloat = f.swatch == nil ? 0 : 22
+        let bg = NSRect(x: ir.midX - (sz.width + sw) / 2 - 16, y: ir.maxY - sz.height - 30,
+                        width: sz.width + sw + 32, height: sz.height + 14)
         tint.blended(withFraction: 0.35, of: .black)?.withAlphaComponent(0.92 * alpha).setFill()
         NSBezierPath(roundedRect: bg, xRadius: bg.height / 2, yRadius: bg.height / 2).fill()
-        str.draw(at: NSPoint(x: bg.minX + 16, y: bg.minY + 7))
+        if let c = f.swatch {
+            let d: CGFloat = 16
+            let dot = NSRect(x: bg.minX + 12, y: bg.midY - d / 2, width: d, height: d)
+            c.withAlphaComponent(alpha).setFill(); NSBezierPath(ovalIn: dot).fill()
+            NSColor.white.withAlphaComponent(alpha).setStroke()
+            let ring = NSBezierPath(ovalIn: dot); ring.lineWidth = 1.5; ring.stroke()
+        }
+        str.draw(at: NSPoint(x: bg.minX + 16 + sw, y: bg.minY + 7))
     }
 
     /// Görseldeki bir pikselin rengi (p: görsel pikseli, sol-alt orijin)
@@ -2916,12 +2925,14 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         let sx = CGFloat(cg.width) / pixelSize.width, sy = CGFloat(cg.height) / pixelSize.height
         let x = Int(p.x * sx), y = Int((pixelSize.height - p.y) * sy)
         guard let px = cg.cropping(to: CGRect(x: min(x, cg.width - 1), y: min(max(y, 0), cg.height - 1), width: 1, height: 1)) else { return nil }
-        var rgba = [UInt8](repeating: 0, count: 4)
-        guard let ctx = CGContext(data: &rgba, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+        // belleği bağlamın kendisi ayırır (geçici dizi işaretçisi kullanmak güvenli değil)
+        guard let ctx = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
                                   space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         ctx.draw(px, in: CGRect(x: 0, y: 0, width: 1, height: 1))
-        return NSColor(srgbRed: CGFloat(rgba[0]) / 255, green: CGFloat(rgba[1]) / 255, blue: CGFloat(rgba[2]) / 255, alpha: 1)
+        guard let data = ctx.data else { return nil }
+        let p8 = data.bindMemory(to: UInt8.self, capacity: 4)
+        return NSColor(srgbRed: CGFloat(p8[0]) / 255, green: CGFloat(p8[1]) / 255, blue: CGFloat(p8[2]) / 255, alpha: 1)
     }
 
     // yazı aracı
@@ -3646,6 +3657,8 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
     let onClose: (AnnotationWindowController) -> Void
     let onSaved: () -> Void
     var colorButtons: [NSButton] = []
+    let customColorButton = NSButton(title: "", target: nil, action: nil)
+    var customColor: NSColor?
     let status = NSTextField(labelWithString: "")
     let undoButton = NSButton(title: "Geri Al", target: nil, action: nil)
     var toolControl: NSSegmentedControl!
@@ -3665,8 +3678,8 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         ("Cetvel", "ruler", "Cetvel: iki nokta arasını sürükle, uzunluğu piksel olarak yazar"),
         ("Renk", "eyedropper", "Renk seç: görselde bir yere tıkla; HEX kopyalanır ve kalem rengi olur"),
         ("Metin", "text.viewfinder", "Metni kopyala: yazının olduğu alanı sürükleyerek seç"),
-        ("▦", nil, "Pikselleştir: alanı sürükleyerek seç"),
-        ("◌", nil, "Bulanıklaştır: alanı sürükleyerek seç"),
+        ("Piksel", "checkerboard.rectangle", "Pikselleştir: gizlemek istediğin alanı sürükleyerek seç"),
+        ("Bulanık", "drop.halffull", "Bulanıklaştır: gizlemek istediğin alanı sürükleyerek seç"),
         ("Silgi", "eraser", "Silgi: tıklayınca bütün işaret / sadece dokunduğun yer seç"),
         ("Kırp", "crop", "Kırp: kenarları sürükle, Enter ile uygula")]
 
@@ -3700,9 +3713,13 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
             let hex = String(format: "#%02X%02X%02X", Int((c.redComponent * 255).rounded()),
                              Int((c.greenComponent * 255).rounded()), Int((c.blueComponent * 255).rounded()))
             Output.copyText(hex)
+            self.customColor = c
+            self.customColorButton.layer?.backgroundColor = c.cgColor
+            self.customColorButton.isHidden = false
             self.highlightColor(-1)
+            self.canvas.editor?.textColor = c
             self.status.stringValue = "\(hex) kopyalandı ✓ · kalem rengi oldu"
-            self.canvas.showFlash("✓ \(hex) kopyalandı · kalem rengi oldu")
+            self.canvas.showFlash("✓ \(hex) kopyalandı · kalem rengi oldu", swatch: c)
         }
         canvas.onStatus = { [weak self] t in self?.status.stringValue = t }
         canvas.onCropped = { [weak self] applied in
@@ -3742,6 +3759,16 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
             b.heightAnchor.constraint(equalToConstant: 18).isActive = true
             colors.addArrangedSubview(b); colorButtons.append(b)
         }
+        // renk seçiciyle alınan renk: paletin sonunda belirir
+        customColorButton.target = self; customColorButton.action = #selector(customColorClicked)
+        customColorButton.isBordered = false; customColorButton.wantsLayer = true
+        customColorButton.layer?.cornerRadius = 9
+        customColorButton.translatesAutoresizingMaskIntoConstraints = false
+        customColorButton.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        customColorButton.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        customColorButton.isHidden = true
+        customColorButton.toolTip = "Renk seçiciyle aldığın renk"
+        colors.addArrangedSubview(customColorButton)
         highlightColor(0)
 
         let slider = NSSlider(value: 4, minValue: 1, maxValue: 16, target: self, action: #selector(widthChanged(_:)))
@@ -3781,12 +3808,21 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         window?.initialFirstResponder = canvas
     }
 
+    /// idx: palet sırası; -1 = renk seçiciyle alınan özel renk
     func highlightColor(_ idx: Int) {
         for (i, b) in colorButtons.enumerated() {
             let selected = i == idx
             b.layer?.borderWidth = selected ? 2.5 : (Self.palette[i] == .white ? 1 : 0)
             b.layer?.borderColor = (selected ? NSColor.controlAccentColor : NSColor.systemGray).cgColor
         }
+        customColorButton.layer?.borderWidth = idx == -1 ? 2.5 : 1
+        customColorButton.layer?.borderColor = (idx == -1 ? NSColor.controlAccentColor : NSColor.systemGray).cgColor
+    }
+
+    @objc func customColorClicked() {
+        guard let c = customColor else { return }
+        canvas.color = c; highlightColor(-1)
+        canvas.editor?.textColor = c
     }
 
     @objc func toolChanged(_ s: NSSegmentedControl) {
