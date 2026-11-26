@@ -2728,6 +2728,7 @@ struct Mark {
     var curved = false
     var labelPx: CGFloat = 0     // cetvel yazısının boyu (görsel pikseli)
     var soft = false             // fosforlu kalem: yumuşak kenar
+    var shape = 0                // şekil aracı: 0 kutu, 1 daire/elips, 2 düz çizgi
 }
 
 // MARK: - Yol yardımcıları
@@ -2855,6 +2856,9 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
     }
     var arrowCurved = UserDefaults.standard.bool(forKey: "arrowCurved") {
         didSet { UserDefaults.standard.set(arrowCurved, forKey: "arrowCurved") }
+    }
+    var shapeKind = UserDefaults.standard.integer(forKey: "shapeKind") {
+        didSet { UserDefaults.standard.set(shapeKind, forKey: "shapeKind") }
     }
     var markerSoft = UserDefaults.standard.bool(forKey: "markerSoft") {
         didSet { UserDefaults.standard.set(markerSoft, forKey: "markerSoft") }
@@ -3306,8 +3310,16 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             (m.tool == .marker ? m.color.withAlphaComponent(0.35) : m.color).setStroke()
             path.stroke()
         case .rect:
-            guard let rr = rectOf(m) else { return }
-            let p = NSBezierPath(roundedRect: rr, xRadius: m.width, yRadius: m.width)
+            guard let rr = rectOf(m), let a = m.points.first, let b = m.points.last else { return }
+            let p: NSBezierPath
+            switch m.shape {
+            case 1: p = NSBezierPath(ovalIn: rr)
+            case 2:
+                p = NSBezierPath()
+                p.move(to: a); p.line(to: b)
+                p.lineCapStyle = .round
+            default: p = NSBezierPath(roundedRect: rr, xRadius: m.width, yRadius: m.width)
+            }
             p.lineWidth = m.width; m.color.setStroke(); p.stroke()
         case .arrow:
             drawArrow(m)
@@ -3378,6 +3390,16 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
                 || hypot(p.x - last.x, p.y - last.y) <= arrowHeadSize(m) * 0.7 + tol
         case .rect:
             guard let rr = rectOf(m) else { return false }
+            if m.shape == 2, let a = m.points.first, let b = m.points.last {
+                return PathMath.segDist(p, a, b) <= m.width / 2 + tol
+            }
+            if m.shape == 1 {
+                // elipsin çizgisine yakınlık (normalize uzaklık)
+                let rx = max(rr.width / 2, 1), ry = max(rr.height / 2, 1)
+                let dx = p.x - rr.midX, dy = p.y - rr.midY
+                let d = sqrt(dx * dx / (rx * rx) + dy * dy / (ry * ry))
+                return abs(d - 1) * min(rx, ry) <= m.width / 2 + tol
+            }
             let outer = rr.insetBy(dx: -(m.width / 2 + tol), dy: -(m.width / 2 + tol))
             let inset = m.width / 2 + tol
             let inner = rr.insetBy(dx: inset, dy: inset)
@@ -3487,7 +3509,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             }
         default:
             current = Mark(tool: tool, color: color, width: lineWidth / scale, points: [p],
-                           arrow: arrowStyle, curved: arrowCurved, soft: markerSoft)
+                           arrow: arrowStyle, curved: arrowCurved, soft: markerSoft, shape: shapeKind)
         }
     }
     override func mouseDragged(with e: NSEvent) {
@@ -3688,7 +3710,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
     static let tools: [(label: String, symbol: String?, tip: String)] = [
         ("✏️", nil, "Kalem"),
         ("↗", nil, "Ok: tıklayınca sivri/yumuşak ve düz/eğri seç"),
-        ("▢", nil, "Kutu"),
+        ("▢", nil, "Şekil: tıklayınca kutu / daire / düz çizgi seç"),
         ("🖍", nil, "Fosforlu kalem: tıklayınca sert / yumuşak kenar seç"),
         ("T", nil, "Yazı: tıklayınca font seç; resme tıkla, yaz, Enter"),
         ("😀", nil, "Emoji: tıklayınca emoji seç; resme tıklayarak yapıştır"),
@@ -3766,6 +3788,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         }
         tools.selectedSegment = 0
         toolControl = tools
+        tools.setLabel(["▢", "◯", "╱"][min(max(canvas.shapeKind, 0), 2)], forSegment: Tool.rect.rawValue)
 
         let colors = NSStackView(); colors.spacing = 5
         for (i, c) in Self.palette.enumerated() {
@@ -3862,6 +3885,12 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         case .arrow: popUpMenu(arrowMenu(), under: s, segment: s.selectedSegment)
         case .text: popUpMenu(fontMenu(), under: s, segment: s.selectedSegment)
         case .emoji: popUpMenu(emojiMenu(), under: s, segment: s.selectedSegment)
+        case .rect:
+            let m = NSMenu()
+            for (i, t) in ["▢  Kutu", "◯  Daire / Elips", "╱  Düz çizgi"].enumerated() {
+                m.addItem(menuItem(t, #selector(setShape(_:)), tag: i, on: canvas.shapeKind == i))
+            }
+            popUpMenu(m, under: s, segment: s.selectedSegment)
         case .marker:
             let m = NSMenu()
             m.addItem(menuItem("Sert kenar", #selector(setMarkerSoft(_:)), tag: 0, on: !canvas.markerSoft))
@@ -3958,6 +3987,10 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func setEmoji(_ i: NSMenuItem) { canvas.emoji = i.title }
     @objc func setMarkerSoft(_ i: NSMenuItem) { canvas.markerSoft = i.tag == 1 }
+    @objc func setShape(_ i: NSMenuItem) {
+        canvas.shapeKind = i.tag
+        toolControl.setLabel(["▢", "◯", "╱"][min(max(i.tag, 0), 2)], forSegment: Tool.rect.rawValue)
+    }
 
     /// Renk kutusu: macOS renk penceresinden istenen her renk
     @objc func colorWellChanged(_ w: NSColorWell) {
