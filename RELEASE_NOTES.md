@@ -1,4 +1,4 @@
-• Pikselleştir ve Bulanıklaştır araçlarının simgeleri daha anlaşılır
-• Renk seçince renk paletinde belirir, seçili olur ve "kopyalandı" balonu çıkar
-• Renk seçicide rengin bazen yanlış okunması düzeltildi
-• Metin kopyalanınca seçilen alan yeşil parlar
+• İşaretlemede renk kutusu: hazır renklerin yanında istediğin her rengi seçebilirsin
+• Fosforlu kalemde sert ve yumuşak kenar seçeneği
+• Pikselleştir ve Bulanıklaştır simgeleri daha anlaşılır
+• Renk seçince renk palette belirir ve "kopyalandı" balonu çıkar

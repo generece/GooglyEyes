@@ -2727,6 +2727,7 @@ struct Mark {
     var arrow: ArrowStyle = .sharp
     var curved = false
     var labelPx: CGFloat = 0     // cetvel yazısının boyu (görsel pikseli)
+    var soft = false             // fosforlu kalem: yumuşak kenar
 }
 
 // MARK: - Yol yardımcıları
@@ -2854,6 +2855,9 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
     }
     var arrowCurved = UserDefaults.standard.bool(forKey: "arrowCurved") {
         didSet { UserDefaults.standard.set(arrowCurved, forKey: "arrowCurved") }
+    }
+    var markerSoft = UserDefaults.standard.bool(forKey: "markerSoft") {
+        didSet { UserDefaults.standard.set(markerSoft, forKey: "markerSoft") }
     }
     var emoji = UserDefaults.standard.string(forKey: "emoji") ?? "👀" {
         didSet { UserDefaults.standard.set(emoji, forKey: "emoji") }
@@ -3285,6 +3289,19 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             path.move(to: first)
             if m.points.count == 1 { path.line(to: CGPoint(x: first.x + 0.1, y: first.y)) }
             for p in m.points.dropFirst() { path.line(to: p) }
+            if m.tool == .marker && m.soft, let ctx = NSGraphicsContext.current?.cgContext {
+                // yumuşak kenar: daha ince çekirdek + aynı renkte geniş bulanık hale
+                let w = m.width * 4
+                ctx.saveGState()
+                ctx.setShadow(offset: .zero, blur: w * 0.9, color: m.color.withAlphaComponent(0.45).cgColor)
+                ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+                path.lineWidth = w * 0.55
+                m.color.withAlphaComponent(0.7).setStroke()
+                path.stroke()
+                ctx.endTransparencyLayer()
+                ctx.restoreGState()
+                return
+            }
             path.lineWidth = m.tool == .marker ? m.width * 4 : m.width
             (m.tool == .marker ? m.color.withAlphaComponent(0.35) : m.color).setStroke()
             path.stroke()
@@ -3470,7 +3487,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             }
         default:
             current = Mark(tool: tool, color: color, width: lineWidth / scale, points: [p],
-                           arrow: arrowStyle, curved: arrowCurved)
+                           arrow: arrowStyle, curved: arrowCurved, soft: markerSoft)
         }
     }
     override func mouseDragged(with e: NSEvent) {
@@ -3671,7 +3688,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         ("✏️", nil, "Kalem"),
         ("↗", nil, "Ok: tıklayınca sivri/yumuşak ve düz/eğri seç"),
         ("▢", nil, "Kutu"),
-        ("🖍", nil, "Fosforlu kalem"),
+        ("🖍", nil, "Fosforlu kalem: tıklayınca sert / yumuşak kenar seç"),
         ("T", nil, "Yazı: tıklayınca font seç; resme tıkla, yaz, Enter"),
         ("😀", nil, "Emoji: tıklayınca emoji seç; resme tıklayarak yapıştır"),
         ("①", nil, "Numaralı işaret: her tık 1, 2, 3…"),
@@ -3769,6 +3786,15 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         customColorButton.isHidden = true
         customColorButton.toolTip = "Renk seçiciyle aldığın renk"
         colors.addArrangedSubview(customColorButton)
+        let well = NSColorWell(frame: NSRect(x: 0, y: 0, width: 26, height: 20))
+        if #available(macOS 13.0, *) { well.colorWellStyle = .minimal }
+        well.color = .systemRed
+        well.target = self; well.action = #selector(colorWellChanged(_:))
+        well.toolTip = "İstediğin rengi seç"
+        well.translatesAutoresizingMaskIntoConstraints = false
+        well.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        well.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        colors.addArrangedSubview(well)
         highlightColor(0)
 
         let slider = NSSlider(value: 4, minValue: 1, maxValue: 16, target: self, action: #selector(widthChanged(_:)))
@@ -3834,6 +3860,11 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         case .arrow: popUpMenu(arrowMenu(), under: s, segment: s.selectedSegment)
         case .text: popUpMenu(fontMenu(), under: s, segment: s.selectedSegment)
         case .emoji: popUpMenu(emojiMenu(), under: s, segment: s.selectedSegment)
+        case .marker:
+            let m = NSMenu()
+            m.addItem(menuItem("Sert kenar", #selector(setMarkerSoft(_:)), tag: 0, on: !canvas.markerSoft))
+            m.addItem(menuItem("Yumuşak kenar", #selector(setMarkerSoft(_:)), tag: 1, on: canvas.markerSoft))
+            popUpMenu(m, under: s, segment: s.selectedSegment)
         case .ruler: status.stringValue = "Ölçmek istediğin iki nokta arasını sürükle"
         case .eyedropper: status.stringValue = "Rengini almak istediğin yere tıkla"
         case .ocr: status.stringValue = "Metnini kopyalamak istediğin alanı sürükle"
@@ -3906,6 +3937,18 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func setEmoji(_ i: NSMenuItem) { canvas.emoji = i.title }
+    @objc func setMarkerSoft(_ i: NSMenuItem) { canvas.markerSoft = i.tag == 1 }
+
+    /// Renk kutusu: macOS renk penceresinden istenen her renk
+    @objc func colorWellChanged(_ w: NSColorWell) {
+        let c = w.color.usingColorSpace(.sRGB) ?? w.color
+        canvas.color = c
+        canvas.editor?.textColor = c
+        customColor = c
+        customColorButton.layer?.backgroundColor = c.cgColor
+        customColorButton.isHidden = false
+        highlightColor(-1)
+    }
 
     @objc func colorChanged(_ b: NSButton) {
         canvas.color = Self.palette[b.tag]; highlightColor(b.tag)
