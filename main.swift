@@ -2867,6 +2867,49 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
     var onPickColor: ((NSColor) -> Void)?
     var onStatus: ((String) -> Void)?
 
+    // kısa görsel geri bildirim: seçilen alan yeşil parlar + ortada balon
+    var flash: (rect: CGRect?, text: String, ok: Bool, start: CFTimeInterval)?
+    var flashTimer: Timer?
+    let flashDuration: CFTimeInterval = 1.6
+
+    func showFlash(_ text: String, rect: CGRect? = nil, ok: Bool = true) {
+        flash = (rect, text, ok, CACurrentMediaTime())
+        flashTimer?.invalidate()
+        flashTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] t in
+            guard let self = self, let f = self.flash else { t.invalidate(); return }
+            if CACurrentMediaTime() - f.start > self.flashDuration { self.flash = nil; t.invalidate() }
+            self.needsDisplay = true
+        }
+        needsDisplay = true
+    }
+
+    func drawFlash() {
+        guard let f = flash else { return }
+        let t = CACurrentMediaTime() - f.start
+        let tint = f.ok ? NSColor.systemGreen : NSColor.systemOrange
+        if let r = f.rect {
+            let a = max(0, 1 - t / 0.9)
+            let v = viewRect(of: r)
+            tint.withAlphaComponent(0.28 * a).setFill()
+            NSBezierPath(roundedRect: v, xRadius: 4, yRadius: 4).fill()
+            let b = NSBezierPath(roundedRect: v.insetBy(dx: 1, dy: 1), xRadius: 4, yRadius: 4)
+            b.lineWidth = 2
+            tint.withAlphaComponent(0.9 * a).setStroke()
+            b.stroke()
+        }
+        // balon: son 0.3 sn'de söner
+        let alpha = min(1, max(0, (flashDuration - t) / 0.3))
+        let str = NSAttributedString(string: f.text, attributes: [
+            .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(alpha)])
+        let sz = str.size()
+        let ir = imageRect()
+        let bg = NSRect(x: ir.midX - sz.width / 2 - 16, y: ir.maxY - sz.height - 30, width: sz.width + 32, height: sz.height + 14)
+        tint.blended(withFraction: 0.35, of: .black)?.withAlphaComponent(0.92 * alpha).setFill()
+        NSBezierPath(roundedRect: bg, xRadius: bg.height / 2, yRadius: bg.height / 2).fill()
+        str.draw(at: NSPoint(x: bg.minX + 16, y: bg.minY + 7))
+    }
+
     /// Görseldeki bir pikselin rengi (p: görsel pikseli, sol-alt orijin)
     func pixelColor(at p: CGPoint) -> NSColor? {
         guard fullRect.contains(p), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
@@ -3144,6 +3187,7 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         NSGraphicsContext.restoreGraphicsState()
 
         if tool == .crop { drawCropOverlay() }
+        drawFlash()
     }
 
     /// İşaretler ayrı bir katmana çizilir; böylece silgi sadece işaretleri siler, görseli değil
@@ -3455,9 +3499,18 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             OCR.recognize(part) { [weak self] text, err in
                 DispatchQueue.main.async {
                     let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if let err = err { self?.onStatus?("Metin okunamadı: \(err)"); return }
-                    if t.isEmpty { self?.onStatus?("Metin bulunamadı"); return }
+                    if let err = err {
+                        self?.onStatus?("Metin okunamadı: \(err)")
+                        self?.showFlash("Metin okunamadı", rect: rr, ok: false)
+                        return
+                    }
+                    if t.isEmpty {
+                        self?.onStatus?("Metin bulunamadı")
+                        self?.showFlash("Bu alanda metin bulunamadı", rect: rr, ok: false)
+                        return
+                    }
                     Output.copyText(t)
+                    self?.showFlash("✓ Metin kopyalandı (\(t.count) karakter)", rect: rr)
                     self?.onStatus?("Metin kopyalandı ✓ (\(t.count) karakter)")
                 }
             }
@@ -3649,6 +3702,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
             Output.copyText(hex)
             self.highlightColor(-1)
             self.status.stringValue = "\(hex) kopyalandı ✓ · kalem rengi oldu"
+            self.canvas.showFlash("✓ \(hex) kopyalandı · kalem rengi oldu")
         }
         canvas.onStatus = { [weak self] t in self?.status.stringValue = t }
         canvas.onCropped = { [weak self] applied in
