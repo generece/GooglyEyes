@@ -2200,7 +2200,7 @@ enum ImageTools {
 
     enum Job: Int { case png, compress, pot }
 
-    /// Görselleri yan yana ya da alt alta tek görselde birleştirir (ölçek değişmez, ortalanır)
+    /// Görselleri yan yana ya da alt alta tek görselde birleştirir (ölçek değişmez, ortalanır, zemin #191919)
     static func merge(_ images: [CGImage], horizontal: Bool, gap: Int = 24) -> CGImage? {
         guard !images.isEmpty else { return nil }
         let pad = gap
@@ -2216,7 +2216,7 @@ enum ImageTools {
               let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.setFillColor(CGColor(srgbRed: 0x19 / 255.0, green: 0x19 / 255.0, blue: 0x19 / 255.0, alpha: 1))   // #191919
         ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
         ctx.interpolationQuality = .high
         if horizontal {
@@ -2819,7 +2819,7 @@ enum Output {
 // MARK: - İşaretleme görünümü
 
 /// Sıra, araç çubuğundaki düğme sırasıyla aynı olmalı
-enum Tool: Int { case pen, arrow, rect, marker, text, emoji, number, ruler, eyedropper, ocr, pixelate, blur, eraser, crop }
+enum Tool: Int { case pen, arrow, rect, marker, fill, text, emoji, number, ruler, eyedropper, ocr, pixelate, blur, eraser, crop }
 
 /// Yazı aracı için font seçenekleri
 enum TextFont: Int, CaseIterable {
@@ -2868,6 +2868,76 @@ struct Mark {
     var labelPx: CGFloat = 0     // cetvel yazısının boyu (görsel pikseli)
     var soft = false             // fosforlu kalem: yumuşak kenar
     var shape = 0                // şekil aracı: 0 kutu, 1 daire/elips, 2 düz çizgi
+    var mask: CGImage?           // doldurma: boyanacak alan (beyaz = boya)
+}
+
+// MARK: - Boya kovası
+
+enum FloodFill {
+    /// Başlangıç noktasının rengine benzeyen bitişik alanın maskesi (gri; 255 = boyanacak)
+    static func mask(of img: CGImage, seedX: Int, seedYFromBottom: Int, tolerance: Int = 40) -> CGImage? {
+        let w = img.width, h = img.height
+        guard w > 0, h > 0, seedX >= 0, seedX < w, seedYFromBottom >= 0, seedYFromBottom < h,
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let data = ctx.data else { return nil }
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let px = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        let sy = h - 1 - seedYFromBottom                     // bellek satırları yukarıdan aşağı
+        let si = (sy * w + seedX) * 4
+        let r0 = Int(px[si]), g0 = Int(px[si + 1]), b0 = Int(px[si + 2])
+        func similar(_ i: Int) -> Bool {
+            abs(Int(px[i]) - r0) <= tolerance && abs(Int(px[i + 1]) - g0) <= tolerance && abs(Int(px[i + 2]) - b0) <= tolerance
+        }
+        var out = [UInt8](repeating: 0, count: w * h)
+        var stack: [(Int, Int)] = [(seedX, sy)]
+        stack.reserveCapacity(4096)
+        // satır taramalı doldurma
+        while let (x0, y) = stack.popLast() {
+            var x = x0
+            while x >= 0, out[y * w + x] == 0, similar((y * w + x) * 4) { x -= 1 }
+            x += 1
+            var upOpen = false, downOpen = false
+            while x < w, out[y * w + x] == 0, similar((y * w + x) * 4) {
+                out[y * w + x] = 255
+                if y > 0 {
+                    let ok = out[(y - 1) * w + x] == 0 && similar(((y - 1) * w + x) * 4)
+                    if ok && !upOpen { stack.append((x, y - 1)) }
+                    upOpen = ok
+                }
+                if y < h - 1 {
+                    let ok = out[(y + 1) * w + x] == 0 && similar(((y + 1) * w + x) * 4)
+                    if ok && !downOpen { stack.append((x, y + 1)) }
+                    downOpen = ok
+                }
+                x += 1
+            }
+        }
+        // kenarlarda boşluk kalmasın diye maskeyi 1 piksel genişlet
+        var grown = out
+        for y in 0..<h {
+            for x in 0..<w where out[y * w + x] == 0 {
+                if (x > 0 && out[y * w + x - 1] == 255) || (x < w - 1 && out[y * w + x + 1] == 255)
+                    || (y > 0 && out[(y - 1) * w + x] == 255) || (y < h - 1 && out[(y + 1) * w + x] == 255) {
+                    grown[y * w + x] = 255
+                }
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(grown) as CFData) else { return nil }
+        return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: w,
+                       space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    /// Silgi için: nokta maskenin boyalı kısmında mı (p: görsel pikseli, sol-alt orijin)
+    static func maskContains(_ mask: CGImage?, _ p: CGPoint, height: CGFloat) -> Bool {
+        guard let m = mask, let data = m.dataProvider?.data, let bytes = CFDataGetBytePtr(data) else { return false }
+        let sx = CGFloat(m.width) / max(height * CGFloat(m.width) / CGFloat(m.height), 1)
+        let x = Int(p.x * sx), y = m.height - 1 - Int(p.y * CGFloat(m.height) / height)
+        guard x >= 0, x < m.width, y >= 0, y < m.height else { return false }
+        return bytes[y * m.bytesPerRow + x] > 127
+    }
 }
 
 // MARK: - Yol yardımcıları
@@ -3064,6 +3134,20 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             let ring = NSBezierPath(ovalIn: dot); ring.lineWidth = 1.5; ring.stroke()
         }
         str.draw(at: NSPoint(x: bg.minX + 16 + sw, y: bg.minY + 7))
+    }
+
+    /// Görsel + işaretler, tam çözünürlükte (doldurma alanını bulmak için)
+    func flattened() -> CGImage? {
+        let w = Int(pixelSize.width), h = Int(pixelSize.height)
+        guard w > 0, h > 0, let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        image.draw(in: fullRect)
+        drawAll(includeCurrent: false)
+        NSGraphicsContext.restoreGraphicsState()
+        return ctx.makeImage()
     }
 
     /// Görseldeki bir pikselin rengi (p: görsel pikseli, sol-alt orijin)
@@ -3508,6 +3592,13 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
             ctx.addPath(cp)
             ctx.strokePath()
             ctx.restoreGState()
+        case .fill:
+            guard let mk = m.mask, let ctx = NSGraphicsContext.current?.cgContext else { return }
+            ctx.saveGState()
+            ctx.clip(to: fullRect, mask: mk)
+            ctx.setFillColor(m.color.cgColor)
+            ctx.fill(fullRect)
+            ctx.restoreGState()
         case .crop, .eyedropper, .ocr:
             break
         }
@@ -3556,6 +3647,8 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         case .ruler:
             guard let last = m.points.last else { return false }
             return PathMath.segDist(p, first, last) <= max(m.width * 4, m.labelPx) + tol
+        case .fill:
+            return FloodFill.maskContains(m.mask, p, height: pixelSize.height)
         case .eraser, .crop, .eyedropper, .ocr:
             return false
         }
@@ -3629,6 +3722,13 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
                 color = c
                 onPickColor?(c)
             }
+        case .fill:
+            // o anki görüntüye (görsel + işaretler) göre benzer renkli bitişik alanı bul
+            guard fullRect.contains(p), let base = flattened(),
+                  let mk = FloodFill.mask(of: base, seedX: Int(p.x * CGFloat(base.width) / pixelSize.width),
+                                          seedYFromBottom: Int(p.y * CGFloat(base.height) / pixelSize.height)) else { return }
+            pushHistory()
+            marks.append(Mark(tool: .fill, color: color.withAlphaComponent(1), width: 0, points: [p], mask: mk))
         case .ruler:
             var m = Mark(tool: .ruler, color: color, width: max(lineWidth * 0.5, 1.5) / scale, points: [p])
             m.labelPx = 12 / scale
@@ -3851,6 +3951,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         ("↗", nil, "Ok: tıklayınca sivri/yumuşak ve düz/eğri seç"),
         ("▢", nil, "Şekil: tıklayınca kutu / daire / düz çizgi seç"),
         ("🖍", nil, "Fosforlu kalem: tıklayınca sert / yumuşak kenar seç"),
+        ("🪣", nil, "Doldur: tıkladığın yerdeki benzer renkli alanı seçili renkle boyar"),
         ("T", nil, "Yazı: tıklayınca font seç; resme tıkla, yaz, Enter"),
         ("😀", nil, "Emoji: tıklayınca emoji seç; resme tıklayarak yapıştır"),
         ("①", nil, "Numaralı işaret: her tık 1, 2, 3…"),
@@ -4024,6 +4125,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         case .arrow: popUpMenu(arrowMenu(), under: s, segment: s.selectedSegment)
         case .text: popUpMenu(fontMenu(), under: s, segment: s.selectedSegment)
         case .emoji: popUpMenu(emojiMenu(), under: s, segment: s.selectedSegment)
+        case .fill: status.stringValue = "Boyamak istediğin alana tıkla (benzer renkli bitişik alan boyanır)"
         case .rect:
             let m = NSMenu()
             for (i, t) in ["▢  Kutu", "◯  Daire / Elips", "╱  Düz çizgi"].enumerated() {

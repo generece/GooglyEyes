@@ -1,4 +1,3 @@
-• Ekran görüntülerini birleştir: menüden "Birleştirme Başlat" de, art arda çek, sonra "Birleştir → Yan yana / Alt alta"
-• Birden fazla görseli gözlere sürükleyip bırakınca yan yana ya da alt alta birleştirebilirsin
-• Şekil aracında daire/elips ve düz çizgi
-• İşaretlemede büyüteçli renk seçici
+• İşaretlemede Doldur aracı 🪣: tıkladığın alanı seçili renkle boyar (arka planı boyamak için ideal)
+• Birleştirilen görüntülerin arka planı artık koyu (#191919)
+• Ekran görüntülerini birleştirme: "Birleştirme Başlat" ya da gözlere sürükle-bırak
