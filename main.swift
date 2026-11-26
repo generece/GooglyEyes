@@ -36,6 +36,11 @@ enum Pref {
         get { d.object(forKey: "randomBehaviors") as? Bool ?? true }
         set { d.set(newValue, forKey: "randomBehaviors") }
     }
+    /// true: panoya + masaüstüne, false: sadece panoya
+    static var saveToDesktop: Bool {
+        get { d.object(forKey: "saveToDesktop") as? Bool ?? true }
+        set { d.set(newValue, forKey: "saveToDesktop") }
+    }
     static var webpToPng: Bool {
         get { d.object(forKey: "webpToPng") as? Bool ?? true }
         set { d.set(newValue, forKey: "webpToPng") }
@@ -91,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var localClickMonitor: Any?
     var capturing = false
     var selectionWindows: [NSWindow] = []
+    var frozen: [CGDirectDisplayID: CGImage] = [:]
     let webpWatcher = WebpWatcher()
 
     // çöp kutusu korkusu
@@ -195,6 +201,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(item("Panodaki Görseli Aç ve İşaretle…", #selector(openAnnotatorFromClipboard)))
         let auto = item("⌥⇧S Sonrası İşaretlemeyi Aç", #selector(toggleAutoAnnotate)); auto.tag = 43
         m.addItem(auto)
+        let saveItem = NSMenuItem(title: "Ekran Görüntüsünü Kaydet", action: nil, keyEquivalent: "")
+        let saveMenu = NSMenu()
+        let onlyClip = item("Sadece Panoya", #selector(setSaveTarget(_:))); onlyClip.tag = 300
+        let both = item("Panoya + Masaüstüne", #selector(setSaveTarget(_:))); both.tag = 301
+        saveMenu.addItem(onlyClip); saveMenu.addItem(both)
+        saveItem.submenu = saveMenu
+        m.addItem(saveItem)
         let webp = item("İndirilen WebP'leri PNG'ye Çevir", #selector(toggleWebp)); webp.tag = 45
         webp.toolTip = "İndirilenler ve Masaüstü'ne gelen yeni .webp dosyalarını .png yapar; WebP'nin aslı Çöp Sepeti'ne gider"
         m.addItem(webp)
@@ -247,6 +260,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.item(withTag: 43)?.state = Pref.autoAnnotate ? .on : .off
         menu.item(withTag: 44)?.state = Pref.randomBehaviors ? .on : .off
         menu.item(withTag: 45)?.state = Pref.webpToPng ? .on : .off
+        menu.item(withTag: 300)?.state = Pref.saveToDesktop ? .off : .on
+        menu.item(withTag: 301)?.state = Pref.saveToDesktop ? .on : .off
         for i in menu.items { if let sub = i.submenu { menuWillOpen(sub) } }
         for i in menu.items where i.tag == 100 {
             i.state = (i.representedObject as? Double) == Pref.sleepAfter ? .on : .off
@@ -254,6 +269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleAutoAnnotate() { Pref.autoAnnotate.toggle() }
+    @objc func setSaveTarget(_ sender: NSMenuItem) { Pref.saveToDesktop = sender.tag == 301 }
     @objc func toggleWebp() {
         Pref.webpToPng.toggle()
         if Pref.webpToPng { webpWatcher.start() } else { webpWatcher.stop() }
@@ -610,6 +626,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // seçimden sonra odağı geri vermek için önceki uygulamayı hatırla
         let front = NSWorkspace.shared.frontmostApplication
         previousApp = front?.processIdentifier == ProcessInfo.processInfo.processIdentifier ? nil : front
+
+        // Ekranı HEMEN dondur: odağı almadan önce görüntüyü al. Böylece tarayıcıda açık olan
+        // menü/sekme/açılır pencere odak değişince kapansa bile görüntü kısayola basılan anın hali olur.
+        frozen = [:]
+        if #available(macOS 14.0, *) {
+            Grabber.captureScreens(NSScreen.screens) { [weak self] images in
+                DispatchQueue.main.async {
+                    guard let self = self, self.capturing else { return }
+                    self.frozen = images
+                    self.showSelection()
+                }
+            }
+        } else {
+            showSelection()
+        }
+    }
+
+    /// Seçim katmanını göster (varsa donmuş görüntünün üstünde)
+    func showSelection() {
         NSApp.activate(ignoringOtherApps: true)
         let mouse = NSEvent.mouseLocation
         for screen in NSScreen.screens {
@@ -622,6 +657,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             let v = SelectionView(frame: NSRect(origin: .zero, size: screen.frame.size))
             v.menuBarHeight = screen.frame.maxY - screen.visibleFrame.maxY
+            if let cg = frozen[displayID(of: screen)] {
+                v.frozen = NSImage(cgImage: cg, size: screen.frame.size)
+            }
             v.onDone = { [weak self] r in self?.endSelection(r) }
             w.contentView = v
             w.orderFrontRegardless()
@@ -649,9 +687,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSCursor.arrow.set()
             if let app = app, !app.isTerminated { app.activate(options: []) } else { NSApp.hide(nil) }
         }
+        let shots = frozen
+        frozen = [:]
         guard let r = rect else { endCapture(); return }
         let mid = NSPoint(x: r.midX, y: r.midY)
         let screen = NSScreen.screens.first { NSMouseInRect(mid, $0.frame, false) } ?? NSScreen.main
+
+        // donmuş görüntüden kes
+        if let screen = screen, let full = shots[displayID(of: screen)] {
+            let f = screen.frame
+            let clipped = r.intersection(f)
+            let sx = CGFloat(full.width) / f.width, sy = CGFloat(full.height) / f.height
+            let px = CGRect(x: (clipped.minX - f.minX) * sx, y: (f.maxY - clipped.maxY) * sy,
+                            width: clipped.width * sx, height: clipped.height * sy).integral
+            if let part = full.cropping(to: px) {
+                let rep = NSBitmapImageRep(cgImage: part)
+                rep.size = clipped.size
+                if let data = rep.representation(using: .png, properties: [:]) { finishCapture(data); return }
+            }
+        }
         // seçim katmanı ekrandan tamamen kalksın diye kısa bir bekleme
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
             guard let self = self else { return }
@@ -702,7 +756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         endCapture()
         Output.toClipboard(png: data)
         lastChangeCount = NSPasteboard.general.changeCount
-        if let err = Output.saveToDesktop(png: data, prefix: "Googly") {
+        if Pref.saveToDesktop, let err = Output.saveToDesktop(png: data, prefix: "Googly") {
             alert("Masaüstüne kaydedilemedi", err)
         }
         noteActivity(CACurrentMediaTime())
@@ -887,8 +941,38 @@ final class WebpWatcher {
 
 // MARK: - Ekran yakalama (ScreenCaptureKit)
 
+func displayID(of screen: NSScreen) -> CGDirectDisplayID {
+    (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? CGMainDisplayID()
+}
+
 @available(macOS 14.0, *)
 enum Grabber {
+    /// Bütün ekranların tam çözünürlüklü görüntüsü (seçimden önce "dondurmak" için)
+    static func captureScreens(_ screens: [NSScreen], completion: @escaping ([CGDirectDisplayID: CGImage]) -> Void) {
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+            guard let content = content else { completion([:]); return }
+            let group = DispatchGroup()
+            let lock = NSLock()
+            var out: [CGDirectDisplayID: CGImage] = [:]
+            for screen in screens {
+                let id = displayID(of: screen)
+                guard let display = content.displays.first(where: { $0.displayID == id }) else { continue }
+                let cfg = SCStreamConfiguration()
+                cfg.width = Int((screen.frame.width * screen.backingScaleFactor).rounded())
+                cfg.height = Int((screen.frame.height * screen.backingScaleFactor).rounded())
+                cfg.showsCursor = false
+                cfg.captureResolution = .best
+                group.enter()
+                SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: display, excludingWindows: []),
+                                                 configuration: cfg) { img, _ in
+                    if let img = img { lock.lock(); out[id] = img; lock.unlock() }
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) { completion(out) }
+        }
+    }
+
     /// rect: genel ekran koordinatları (Cocoa, sol-alt orijin); sonuç PNG
     static func capture(rect r: NSRect, on screen: NSScreen, completion: @escaping (Data?, String?) -> Void) {
         let key = NSDeviceDescriptionKey("NSScreenNumber")
@@ -930,6 +1014,7 @@ final class SelectionView: NSView {
     var start: NSPoint?
     var current: NSPoint?
     var menuBarHeight: CGFloat = 0
+    var frozen: NSImage?
     var onDone: ((NSRect?) -> Void)?
     var finished = false
 
@@ -947,9 +1032,20 @@ final class SelectionView: NSView {
         let bar = NSRect(x: 0, y: bounds.maxY - menuBarHeight, width: bounds.width, height: menuBarHeight)
         let rest = NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height - menuBarHeight)
         NSColor.black.withAlphaComponent(0.01).setFill(); bar.fill(using: .copy)
-        NSColor.black.withAlphaComponent(0.12).setFill(); rest.fill(using: .copy)
+        if let img = frozen {
+            // donmuş ekran: menü çubuğu dışındaki alana çiz, seçim dışını hafif karart
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: rest).addClip()
+            img.draw(in: bounds, from: .zero, operation: .copy, fraction: 1)
+            let dim = NSBezierPath(rect: rest)
+            if let s = selRect, s.width > 0, s.height > 0 { dim.append(NSBezierPath(rect: s)); dim.windingRule = .evenOdd }
+            NSColor.black.withAlphaComponent(0.12).setFill(); dim.fill()
+            NSGraphicsContext.restoreGraphicsState()
+        } else {
+            NSColor.black.withAlphaComponent(0.12).setFill(); rest.fill(using: .copy)
+        }
         guard let s = selRect, s.width > 0, s.height > 0 else { return }
-        NSColor.clear.setFill(); s.fill(using: .copy)
+        if frozen == nil { NSColor.clear.setFill(); s.fill(using: .copy) }
         let p = NSBezierPath(rect: s.insetBy(dx: 0.5, dy: 0.5))
         p.lineWidth = 1
         NSColor.white.withAlphaComponent(0.95).setStroke(); p.stroke()
@@ -1976,7 +2072,8 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         undoButton.toolTip = "⌘Z"
         let clear = NSButton(title: "Temizle", target: self, action: #selector(clearAll))
         clear.toolTip = "Tüm işaretleri ve kırpmayı kaldırır"
-        let save = NSButton(title: "Panoya + Masaüstüne", target: self, action: #selector(save))
+        let save = NSButton(title: Pref.saveToDesktop ? "Panoya + Masaüstüne" : "Panoya Kopyala",
+                            target: self, action: #selector(save))
         save.bezelStyle = .rounded
         save.toolTip = "⌘S"
         status.textColor = .secondaryLabelColor
@@ -2084,7 +2181,10 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
     @objc func save() {
         guard let png = canvas.renderPNG() else { return }
         Output.toClipboard(png: png)
-        if let err = Output.saveToDesktop(png: png, prefix: "Googly İşaretli") {
+        if !Pref.saveToDesktop {
+            status.stringValue = "Panoya kopyalandı ✓"
+            onSaved()
+        } else if let err = Output.saveToDesktop(png: png, prefix: "Googly İşaretli") {
             status.stringValue = "Kaydedilemedi: \(err)"
         } else {
             status.stringValue = "Panoya kopyalandı ✓ Masaüstüne kaydedildi ✓"
