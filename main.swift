@@ -3676,6 +3676,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
     var colorButtons: [NSButton] = []
     let customColorButton = NSButton(title: "", target: nil, action: nil)
     var customColor: NSColor?
+    var colorSampler: NSColorSampler?
     let status = NSTextField(labelWithString: "")
     let undoButton = NSButton(title: "Geri Al", target: nil, action: nil)
     var toolControl: NSSegmentedControl!
@@ -3693,7 +3694,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         ("😀", nil, "Emoji: tıklayınca emoji seç; resme tıklayarak yapıştır"),
         ("①", nil, "Numaralı işaret: her tık 1, 2, 3…"),
         ("Cetvel", "ruler", "Cetvel: iki nokta arasını sürükle, uzunluğu piksel olarak yazar"),
-        ("Renk", "eyedropper", "Renk seç: görselde bir yere tıkla; HEX kopyalanır ve kalem rengi olur"),
+        ("Renk", "eyedropper", "Renk seç: büyüteçle istediğin yere tıkla; HEX kopyalanır ve kalem rengi olur"),
         ("Metin", "text.viewfinder", "Metni kopyala: yazının olduğu alanı sürükleyerek seç"),
         ("Piksel", "checkerboard.rectangle", "Pikselleştir: gizlemek istediğin alanı sürükleyerek seç"),
         ("Bulanık", "drop.halffull", "Bulanıklaştır: gizlemek istediğin alanı sürükleyerek seç"),
@@ -3727,6 +3728,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
         }
         canvas.onPickColor = { [weak self] c in
             guard let self = self else { return }
+            self.canvas.color = c
             let hex = String(format: "#%02X%02X%02X", Int((c.redComponent * 255).rounded()),
                              Int((c.greenComponent * 255).rounded()), Int((c.blueComponent * 255).rounded()))
             Output.copyText(hex)
@@ -3866,7 +3868,25 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
             m.addItem(menuItem("Yumuşak kenar", #selector(setMarkerSoft(_:)), tag: 1, on: canvas.markerSoft))
             popUpMenu(m, under: s, segment: s.selectedSegment)
         case .ruler: status.stringValue = "Ölçmek istediğin iki nokta arasını sürükle"
-        case .eyedropper: status.stringValue = "Rengini almak istediğin yere tıkla"
+        case .eyedropper:
+            // macOS'un büyüteçli renk seçicisi: neyi seçtiğini görerek ekranın herhangi bir yerinden renk al
+            status.stringValue = "Rengini almak istediğin yere tıkla (Esc: vazgeç)"
+            let sampler = NSColorSampler()
+            colorSampler = sampler
+            sampler.show { [weak self] color in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.colorSampler = nil
+                    if let c = color?.usingColorSpace(.sRGB) {
+                        self.canvas.onPickColor?(c)
+                    } else {
+                        self.status.stringValue = ""
+                    }
+                    // son çizim aracına dön; hemen o renkle çizilebilsin
+                    self.toolControl.selectedSegment = self.lastDrawTool.rawValue
+                    self.canvas.tool = self.lastDrawTool
+                }
+            }
         case .ocr: status.stringValue = "Metnini kopyalamak istediğin alanı sürükle"
         case .eraser:
             status.stringValue = ""
