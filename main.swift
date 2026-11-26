@@ -142,6 +142,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var recorderBox: AnyObject?            // RegionRecorder (macOS 13+)
     var recordBorder: NSWindow?
     var recordStopTimer: Timer?
+    var collecting = false
+    var collected: [CGImage] = []
     var recordControl: NSPanel?
     var recordClock: Timer?
     var droop: CGFloat = 0                 // ortama göre uykulu göz kapağı (0…1)
@@ -179,6 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var eyesWidth: CGFloat { pad * 2 + eyeSize * 2 + gap }
     var zzzWidth: CGFloat { barHeight * 1.0 }
     var recDotWidth: CGFloat { barHeight * 0.6 }
+    var badgeWidth: CGFloat { barHeight * 0.8 }
 
     // davranış durumu
     var lastMouse = CGPoint.zero
@@ -265,6 +268,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             m.addItem(i)
         }
         m.addItem(item("Panodaki Görseli Aç ve İşaretle…", #selector(openAnnotatorFromClipboard)))
+        let collect = item("Birleştirme Başlat (birden fazla ekran görüntüsü)", #selector(toggleCollect)); collect.tag = 51
+        m.addItem(collect)
+        let mergeItem = NSMenuItem(title: "Birleştir", action: nil, keyEquivalent: ""); mergeItem.tag = 52
+        let mergeMenu = NSMenu()
+        mergeMenu.addItem(item("Yan yana", #selector(mergeCollectedSide)))
+        mergeMenu.addItem(item("Alt alta", #selector(mergeCollectedStack)))
+        mergeItem.submenu = mergeMenu
+        mergeItem.isHidden = true
+        m.addItem(mergeItem)
         m.addItem(.separator())
 
         let tryItem = NSMenuItem(title: "Hareketleri Dene", action: nil, keyEquivalent: "")
@@ -297,6 +309,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        if let c = menu.item(withTag: 51) {
+            c.title = collecting ? "Birleştirmeden Vazgeç (\(collected.count) görüntü)" : "Birleştirme Başlat (birden fazla ekran görüntüsü)"
+        }
+        if let mi = menu.item(withTag: 52) {
+            mi.isHidden = !collecting
+            mi.isEnabled = collected.count >= 2
+            mi.title = collected.count >= 2 ? "Birleştir (\(collected.count) görüntü)" : "Birleştir (en az 2 görüntü gerekli)"
+        }
         for (tag, action) in [(47, HotkeyAction.capture), (48, .color), (49, .ocr), (50, .record)] {
             guard let i = menu.item(withTag: tag) else { continue }
             let hk = Hotkey.load(action)
@@ -563,7 +583,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             eyeSize = size; barHeight = bh
             lastDrawKey = ""
         }
-        let wantLength = eyesWidth + (sleeping ? zzzWidth : 0) + (recording ? recDotWidth : 0)
+        let wantLength = eyesWidth + (sleeping ? zzzWidth : 0) + (recording ? recDotWidth : 0) + (collecting ? badgeWidth : 0)
         if abs(statusItem.length - wantLength) > 0.1 { statusItem.length = wantLength; lastDrawKey = "" }
 
         // basılı tutulan tuşlar: sol → sol göz, sağ → sağ göz kapalı kalır
@@ -672,6 +692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         key += String(format: "|d%.3f|c%d|g%d|b%d", droop, Pref.eyeColor, Pref.glasses, Pref.brows)
         if now < tintUntil { key += "|t\(Int(now * 10))" }
         if recording { key += "|r\(Int(now * 3))" }
+        if collecting { key += "|k\(collected.count)" }
         // Pil dostu: hareket yokken saniyede 10 kare, bir şey değişince hemen 60 kareye çık
         let changed = key != lastDrawKey
         if changed { lastBusy = now }
@@ -694,7 +715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func renderEyes(now: CFTimeInterval, surprise s: CGFloat) -> NSImage {
-        let w = eyesWidth + (sleeping ? zzzWidth : 0) + (recording ? recDotWidth : 0)
+        let w = eyesWidth + (sleeping ? zzzWidth : 0) + (recording ? recDotWidth : 0) + (collecting ? badgeWidth : 0)
         let h = barHeight
         let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { [self] _ in
             for (i, eye) in [leftEye, rightEye].enumerated() {
@@ -703,6 +724,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             drawAccessories(height: h)
             if sleeping { drawZzz(x0: eyesWidth - pad + 1, height: h, now: now) }
+            if collecting {
+                // birikmiş görüntü sayısı
+                let d = h * 0.62
+                let r = NSRect(x: w - badgeWidth / 2 - d / 2, y: h / 2 - d / 2, width: d, height: d)
+                NSColor.systemBlue.setFill()
+                NSBezierPath(ovalIn: r).fill()
+                let t = NSAttributedString(string: "\(collected.count)", attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: d * 0.62, weight: .bold), .foregroundColor: NSColor.white])
+                let sz = t.size()
+                t.draw(at: NSPoint(x: r.midX - sz.width / 2, y: r.midY - sz.height / 2))
+            }
             if recording {
                 // yanıp sönen kırmızı kayıt noktası
                 let on = Int(now * 1.5) % 2 == 0
@@ -1123,6 +1155,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.toast("Metin kopyalandı ✓ (\(t.count) karakter)")
                 }
             }
+            return
+        }
+        if collecting, let cg = NSBitmapImageRep(data: data)?.cgImage {
+            collected.append(cg)
+            lastDrawKey = ""
+            surprise(0.7)
+            toast("\(collected.count). görüntü eklendi · bitince menüden Birleştir")
             return
         }
         Output.toClipboard(png: data)
@@ -1955,6 +1994,37 @@ extension AppDelegate {
 
     @objc func stopRecordingFromClick() { stopRecording() }
 
+    // MARK: Birleştirme (biriktirme modu)
+
+    @objc func toggleCollect() {
+        if collecting {
+            collecting = false; collected = []; lastDrawKey = ""
+            toast("Birleştirme iptal edildi")
+            return
+        }
+        collecting = true; collected = []; lastDrawKey = ""
+        toast("Birleştirme açık: ekran görüntüsü al, hepsi birikir", duration: 2.6)
+    }
+
+    @objc func mergeCollectedSide() { mergeCollected(horizontal: true) }
+    @objc func mergeCollectedStack() { mergeCollected(horizontal: false) }
+
+    func mergeCollected(horizontal: Bool) {
+        let imgs = collected
+        collecting = false; collected = []; lastDrawKey = ""
+        guard imgs.count >= 2, let merged = ImageTools.merge(imgs, horizontal: horizontal), let data = ImageTools.png(merged) else {
+            toast("Birleştirilemedi"); return
+        }
+        Output.toClipboard(png: data)
+        lastChangeCount = NSPasteboard.general.changeCount
+        if Pref.saveToDesktop, let err = Output.saveToDesktop(png: data, prefix: "Googly Birleşik") {
+            alert("Masaüstüne kaydedilemedi", err)
+        }
+        surprise(0.9)
+        toast("\(imgs.count) görüntü birleştirildi ✓")
+        if let img = NSImage(data: data) { openAnnotator(with: img) }
+    }
+
     /// Kaydedilen alanın altında (yer yoksa üstünde) süre ve "Durdur" düğmesi
     func showRecordControl(near r: NSRect) {
         let w: CGFloat = 170, h: CGFloat = 36
@@ -2130,6 +2200,48 @@ enum ImageTools {
 
     enum Job: Int { case png, compress, pot }
 
+    /// Görselleri yan yana ya da alt alta tek görselde birleştirir (ölçek değişmez, ortalanır)
+    static func merge(_ images: [CGImage], horizontal: Bool, gap: Int = 24) -> CGImage? {
+        guard !images.isEmpty else { return nil }
+        let pad = gap
+        let W: Int, H: Int
+        if horizontal {
+            W = images.reduce(0) { $0 + $1.width } + gap * (images.count - 1) + pad * 2
+            H = (images.map { $0.height }.max() ?? 0) + pad * 2
+        } else {
+            W = (images.map { $0.width }.max() ?? 0) + pad * 2
+            H = images.reduce(0) { $0 + $1.height } + gap * (images.count - 1) + pad * 2
+        }
+        guard W > 0, H > 0, W < 32000, H < 32000,
+              let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        ctx.interpolationQuality = .high
+        if horizontal {
+            var x = pad
+            for img in images {
+                let y = (H - img.height) / 2
+                ctx.draw(img, in: CGRect(x: x, y: y, width: img.width, height: img.height))
+                x += img.width + gap
+            }
+        } else {
+            var y = H - pad                                  // ilk görsel en üstte
+            for img in images {
+                y -= img.height
+                let x = (W - img.width) / 2
+                ctx.draw(img, in: CGRect(x: x, y: y, width: img.width, height: img.height))
+                y -= gap
+            }
+        }
+        return ctx.makeImage()
+    }
+
+    static func png(_ img: CGImage) -> Data? {
+        NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])
+    }
+
     /// Sonuç: kısa açıklama (hata varsa nil)
     static func run(_ job: Job, on url: URL) -> String? {
         guard let img = load(url) else { return nil }
@@ -2209,8 +2321,35 @@ extension AppDelegate: NSWindowDelegate {
             i.representedObject = urls
             m.addItem(i)
         }
+        if urls.count >= 2 {
+            m.addItem(.separator())
+            for (title, tag) in [("Yan yana birleştir", 1), ("Alt alta birleştir", 0)] {
+                let i = NSMenuItem(title: title, action: #selector(mergeDroppedFiles(_:)), keyEquivalent: "")
+                i.target = self
+                i.tag = tag
+                i.representedObject = urls
+                m.addItem(i)
+            }
+        }
         let y = button.isFlipped ? button.bounds.maxY + 4 : -4
         m.popUp(positioning: nil, at: NSPoint(x: 0, y: y), in: button)
+    }
+
+    @objc func mergeDroppedFiles(_ sender: NSMenuItem) {
+        guard let urls = sender.representedObject as? [URL], let first = urls.first else { return }
+        let horizontal = sender.tag == 1
+        DispatchQueue.global(qos: .userInitiated).async {
+            let imgs = urls.compactMap { ImageTools.load($0) }
+            let out = ImageTools.uniqueURL(nextTo: first, suffix: "_birlesik", ext: "png")
+            let ok = imgs.count >= 2 && ImageTools.merge(imgs, horizontal: horizontal).map {
+                ImageTools.write($0, to: out, type: "public.png")
+            } == true
+            DispatchQueue.main.async {
+                if !ok { self.toast("Birleştirilemedi"); return }
+                self.surprise(0.6)
+                self.toast("\(imgs.count) görsel birleştirildi ✓ \(out.lastPathComponent)")
+            }
+        }
     }
 
     @objc func runFileJob(_ sender: NSMenuItem) {
