@@ -1112,10 +1112,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         endCapture()
         if captureMode == .text {
             guard let cg = NSBitmapImageRep(data: data)?.cgImage else { return }
-            OCR.recognize(cg) { [weak self] text in
+            OCR.recognize(cg) { [weak self] text, err in
                 DispatchQueue.main.async {
                     guard let self = self else { return }
                     let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let err = err { self.toast("Metin okunamadı: \(err)", duration: 4); return }
                     if t.isEmpty { self.toast("Metin bulunamadı"); return }
                     Output.copyText(t)
                     self.lastChangeCount = NSPasteboard.general.changeCount
@@ -1735,21 +1736,43 @@ enum Toast {
 // MARK: - Metin tanıma (OCR)
 
 enum OCR {
-    static func recognize(_ cg: CGImage, completion: @escaping (String) -> Void) {
-        let req = VNRecognizeTextRequest { r, _ in
+    /// Görseli Vision'ın sorunsuz okuyacağı biçime getir: 8-bit sRGB, beyaz zemin, küçükse büyütülmüş
+    static func normalized(_ cg: CGImage) -> CGImage? {
+        let shortSide = CGFloat(min(cg.width, cg.height))
+        let k = min(3, max(1, 160 / max(shortSide, 1)))           // çok küçük alanlarda yazıyı büyüt
+        let w = Int(CGFloat(cg.width) * k), h = Int(CGFloat(cg.height) * k)
+        guard w > 0, h > 0,
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.interpolationQuality = .high
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+
+    /// completion: (bulunan metin, hata mesajı)
+    static func recognize(_ cg: CGImage, completion: @escaping (String, String?) -> Void) {
+        guard let img = normalized(cg) else { completion("", "Görsel hazırlanamadı"); return }
+        let req = VNRecognizeTextRequest { r, err in
+            if let err = err { completion("", err.localizedDescription); return }
             let lines = (r.results as? [VNRecognizedTextObservation])?
                 .compactMap { $0.topCandidates(1).first?.string } ?? []
-            completion(lines.joined(separator: "\n"))
+            completion(lines.joined(separator: "\n"), nil)
         }
         req.recognitionLevel = .accurate
         req.usesLanguageCorrection = true
-        if #available(macOS 13.0, *) { req.automaticallyDetectsLanguage = true }
         let supported = (try? req.supportedRecognitionLanguages()) ?? []
         let wanted = ["tr-TR", "en-US"].filter { supported.contains($0) }
-        if !wanted.isEmpty { req.recognitionLanguages = wanted }
+        if !wanted.isEmpty {
+            req.recognitionLanguages = wanted
+        } else if #available(macOS 13.0, *) {
+            req.automaticallyDetectsLanguage = true
+        }
         DispatchQueue.global(qos: .userInitiated).async {
-            do { try VNImageRequestHandler(cgImage: cg, options: [:]).perform([req]) }
-            catch { completion("") }
+            do { try VNImageRequestHandler(cgImage: img, options: [:]).perform([req]) }
+            catch { completion("", error.localizedDescription) }
         }
     }
 }
@@ -3417,15 +3440,22 @@ final class AnnotationView: NSView, NSTextFieldDelegate {
         current = nil
         if c.tool == .ocr {
             // seçilen alandaki metni tanı ve panoya kopyala (işaret eklenmez)
-            guard let rr = rectOf(c)?.intersection(fullRect), rr.width * scale > 6, rr.height * scale > 6,
-                  let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+            guard let rr = rectOf(c)?.intersection(fullRect), rr.width * scale > 4, rr.height * scale > 4 else {
+                onStatus?("Daha büyük bir alan seç"); return
+            }
+            guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                onStatus?("Görsel okunamadı"); return
+            }
             let sx = CGFloat(cg.width) / pixelSize.width, sy = CGFloat(cg.height) / pixelSize.height
             let px = CGRect(x: rr.minX * sx, y: (pixelSize.height - rr.maxY) * sy, width: rr.width * sx, height: rr.height * sy).integral
-            guard let part = cg.cropping(to: px) else { return }
+            guard let part = cg.cropping(to: px.intersection(CGRect(x: 0, y: 0, width: cg.width, height: cg.height))) else {
+                onStatus?("Seçilen alan okunamadı"); return
+            }
             onStatus?("Metin okunuyor…")
-            OCR.recognize(part) { [weak self] text in
+            OCR.recognize(part) { [weak self] text, err in
                 DispatchQueue.main.async {
                     let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let err = err { self?.onStatus?("Metin okunamadı: \(err)"); return }
                     if t.isEmpty { self?.onStatus?("Metin bulunamadı"); return }
                     Output.copyText(t)
                     self?.onStatus?("Metin kopyalandı ✓ (\(t.count) karakter)")
@@ -3662,7 +3692,7 @@ final class AnnotationWindowController: NSWindowController, NSWindowDelegate {
 
         let slider = NSSlider(value: 4, minValue: 1, maxValue: 16, target: self, action: #selector(widthChanged(_:)))
         slider.translatesAutoresizingMaskIntoConstraints = false
-        slider.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        slider.widthAnchor.constraint(equalToConstant: 180).isActive = true
         slider.toolTip = "Kalınlık / yazı boyu / numara boyu / silgi boyu"
 
         undoButton.target = self; undoButton.action = #selector(undo); undoButton.bezelStyle = .rounded
